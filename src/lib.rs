@@ -6,8 +6,11 @@
 //! `make` for kbuild, `tar` for tarballs, `gzip` for `/proc/config.gz`, and
 //! `curl`/`wget` for downloads.
 
+pub mod build;
 pub mod catalog;
 pub mod json;
 pub mod kconfig;
+pub mod sources;
+pub mod system;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

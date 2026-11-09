@@ -338,6 +338,8 @@ pub fn verify(wanted: &[(String, Value)], result: &Config) -> Vec<Unapplied> {
             }
         }
     }
+    // Sorted, so the warning list is stable however the fragment was ordered.
+    out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     out
 }
 
