@@ -258,7 +258,8 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { position: sticky; top: 0; background: var(--surface-2); font-size: 12px; color: var(--muted); }
 tr:last-child td { border-bottom: 0; }
-td.mono { font-family: var(--mono); font-size: 12px; }
+td.mono { font-family: var(--mono); font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+td.why { color: var(--muted); width: 24%; white-space: normal; }
 td.before { color: var(--muted); }
 td.after { font-weight: 600; }
 tr.enabled td.after, tr.added td.after { color: var(--ok); }

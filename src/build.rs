@@ -11,8 +11,8 @@ use crate::sources;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -267,9 +267,14 @@ impl Job {
 
     fn begin(&self, id: &str) {
         if let Ok(mut st) = self.state.lock() {
+            let mut title = None;
             if let Some(s) = st.stage_mut(id) {
                 s.state = StageState::Running;
                 s.started = Some(now_secs());
+                title = Some(s.title);
+            }
+            if let Some(title) = title {
+                st.phase = title.to_lowercase();
             }
         }
         self.revision.fetch_add(1, Ordering::Relaxed);
@@ -405,12 +410,7 @@ impl Job {
             let start = from.saturating_sub(st.dropped).min(st.log.len());
             pairs.push(("log", Json::strs(st.log[start..].to_vec())));
         }
-        Json::Obj(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-        )
+        Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
     }
 }
 
@@ -428,7 +428,10 @@ fn kill_group(pid: u32, signal: &str) {
 
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, "{line}")
 }
 
@@ -529,6 +532,9 @@ pub fn run(job: Arc<Job>) {
                 blamed = true;
             }
             StageState::Pending | StageState::Running => {
+                if s.state == StageState::Running && s.detail.is_empty() {
+                    s.detail = "cancelled".to_string();
+                }
                 s.state = StageState::Skipped;
                 if s.ended.is_none() && s.started.is_some() {
                     s.ended = Some(now_secs());
@@ -563,11 +569,16 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
             let url = sources::tarball_url(version);
             let tarball = {
                 let j = job.clone();
-                sources::download(&url, &req.workdir.join("downloads"), &mut |l| j.log(l))
-                    .map_err(|e| {
-                        job.finish("source", StageState::Failed, "download failed");
-                        e.to_string()
-                    })?
+                sources::download(
+                    &url,
+                    &req.workdir.join("downloads"),
+                    &mut |l| j.log(l),
+                    &job.cancel,
+                )
+                .map_err(|e| {
+                    job.finish("source", StageState::Failed, "download failed");
+                    e.to_string()
+                })?
             };
             let j = job.clone();
             sources::extract(&tarball, &req.workdir.join("sources"), &mut |l| j.log(l)).map_err(
@@ -603,6 +614,20 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
         job.finish("deps", StageState::Failed, missing.join(", "));
         return Err(format!("missing build tools: {}", missing.join(", ")));
     }
+    if !req.config_only && !req.skip_tool_check {
+        let need = crate::system::output_tools(req.output.as_str(), &report);
+        if !need.missing.is_empty() {
+            if let Some(cmd) = &need.install_command {
+                job.log(&format!("Install them with: {cmd}"));
+            }
+            job.finish("deps", StageState::Failed, need.missing.join(", "));
+            return Err(format!(
+                "{} output needs tools that are not installed: {}",
+                req.output.as_str(),
+                need.missing.join(", ")
+            ));
+        }
+    }
     let resolved = catalog::resolve_with_extra(&req.selections, &req.extra);
     if resolved.needs_clang() && !req.llvm {
         job.log("Link-time optimisation is clang-only, so this build uses LLVM=1.");
@@ -632,7 +657,8 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
         Base::Running => {
             let path = crate::system::running_config_path()
                 .ok_or("cannot find the running kernel's config on this machine")?;
-            let cfg = Config::load(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            let cfg =
+                Config::load(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
             if cfg.is_empty() {
                 return Err(format!("{} contained no config symbols", path.display()));
             }
@@ -680,7 +706,7 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
         // slips through.
         make(job, &tree, &["olddefconfig"], 1)?;
         job.log("Scanning loaded modules (make localmodconfig)...");
-        make_with_stdin(job, &tree, &["localmodconfig"], 1, &"\n".repeat(4096))?;
+        make_answering_defaults(job, &tree, &["localmodconfig"], 1)?;
         let after = Config::load(&dot_config).map_err(|e| e.to_string())?;
         job.finish(
             "trim",
@@ -697,7 +723,10 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     let mut cfg = Config::load(&dot_config).map_err(|e| e.to_string())?;
     let changed = cfg.merge(&resolved.fragment);
     cfg.save(&dot_config).map_err(|e| e.to_string())?;
-    let fragment_path = req.workdir.join("configs").join(format!("{}.fragment", job.id));
+    let fragment_path = req
+        .workdir
+        .join("configs")
+        .join(format!("{}.fragment", job.id));
     let _ = fs::create_dir_all(fragment_path.parent().unwrap());
     let _ = fs::write(&fragment_path, catalog::fragment_text(&resolved.fragment));
     for c in &resolved.conflicts {
@@ -722,7 +751,10 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     make(job, &tree, &["olddefconfig"], 1)?;
     let final_config = Config::load(&dot_config).map_err(|e| e.to_string())?;
     let changes = kconfig::diff(&base_config, &final_config);
-    let saved = req.workdir.join("configs").join(format!("{}.config", job.id));
+    let saved = req
+        .workdir
+        .join("configs")
+        .join(format!("{}.config", job.id));
     let _ = final_config.save(&saved);
     {
         let mut st = job.state.lock().map_err(|_| "state poisoned")?;
@@ -802,6 +834,8 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
         st.phase = "compiling".into();
     }
     let target = req.output.make_target();
+    // A little slack for filesystems with coarse timestamps.
+    let build_started = SystemTime::now() - Duration::from_secs(2);
     job.log(&format!(
         "Building with {} parallel jobs (target: {target})",
         req.jobs
@@ -809,12 +843,21 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     make(job, &tree, &[target], req.jobs)?;
     let objects = job.state.lock().map(|s| s.objects).unwrap_or(0);
     save_expected_objects(&req.workdir, objects);
-    job.finish("build", StageState::Done, format!("{objects} objects compiled"));
+    job.finish(
+        "build",
+        StageState::Done,
+        format!("{objects} objects compiled"),
+    );
     bail_if_cancelled(job)?;
 
     // --------------------------------------------------------- 10. collect
     job.begin("collect");
-    let artifacts = collect_artifacts(&tree, req.output, &crate::system::kernel_arch());
+    let artifacts = collect_artifacts(
+        &tree,
+        req.output,
+        &crate::system::kernel_arch(),
+        build_started,
+    );
     let total: u64 = artifacts.iter().map(|(_, s)| s).sum();
     {
         let mut st = job.state.lock().map_err(|_| "state poisoned")?;
@@ -823,11 +866,27 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     job.finish(
         "collect",
         StageState::Done,
-        format!("{} files, {:.1} MiB", artifacts.len(), total as f64 / 1048576.0),
+        format!(
+            "{} files, {:.1} MiB",
+            artifacts.len(),
+            total as f64 / 1048576.0
+        ),
     );
 
     // --------------------------------------------------------- 11. install
-    let steps = install_steps(&tree, req.output, &artifacts);
+    let release = kernel_release(job, &tree);
+    let has_modules = final_config.enabled("CONFIG_MODULES");
+    let steps = install_steps(&Built {
+        tree: &tree,
+        output: req.output,
+        artifacts: &artifacts,
+        release: &release,
+        modules: has_modules,
+        family: crate::system::package_family(),
+    });
+    if !release.is_empty() {
+        job.log(&format!("Built kernel release {release}"));
+    }
     if req.install {
         if crate::system::is_root() {
             job.begin("install");
@@ -836,7 +895,10 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
                 st.phase = "installing".into();
             }
             if req.output == Output::Image {
-                make(job, &tree, &["modules_install"], req.jobs)?;
+                // kbuild refuses modules_install on a config without modules.
+                if has_modules {
+                    make(job, &tree, &["modules_install"], req.jobs)?;
+                }
                 make(job, &tree, &["install"], 1)?;
                 job.finish("install", StageState::Done, "installed to /boot");
             } else {
@@ -907,54 +969,98 @@ fn bail_if_cancelled(job: &Arc<Job>) -> Result<(), String> {
     }
 }
 
-/// Run `make` in the tree, streaming every line into the job log.
-fn make(job: &Arc<Job>, tree: &Path, args: &[&str], jobs: usize) -> Result<(), String> {
-    make_with_stdin(job, tree, args, jobs, "")
+/// Runs a command as the leader of its own process group, with a watchdog
+/// that tears the whole group down if this process goes away.
+///
+/// The group is what makes cancelling a parallel build atomic: one signal to
+/// the group reaches make and every compiler it spawned. But a separate group
+/// also means a terminal Ctrl+C never reaches the build, so without the
+/// watchdog, interrupting kertweaker would leave `make -j` running unseen.
+///
+/// The watchdog holds the read end of a pipe whose write end only we hold. When
+/// we exit for any reason - Ctrl+C, a crash, SIGKILL - the pipe closes, the
+/// watchdog wakes and signals its own group. No signal handling on our side,
+/// so no libc dependency.
+const GUARD_SCRIPT: &str = r#"
+exec 3<&0
+( trap '' TERM; exec >/dev/null 2>&1; cat <&3; kill -TERM 0; sleep 2; kill -KILL 0 ) &
+if [ -n "$KT_FEED_NEWLINES" ]; then
+  yes '' | "$@" 3<&-
+else
+  "$@" </dev/null 3<&-
+fi
+"#;
+
+/// A guarded child. Dropping `lifeline` tells the watchdog to kill the group.
+pub struct Guarded {
+    pub child: Child,
+    pub lifeline: Option<std::process::ChildStdin>,
 }
 
-fn make_with_stdin(
+/// Spawn `program args...` under [`GUARD_SCRIPT`]. Arguments are passed as
+/// positional parameters, never interpolated into the script.
+pub fn spawn_guarded(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    feed_newlines: bool,
+) -> std::io::Result<Guarded> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(GUARD_SCRIPT)
+        .arg("kertweaker-build")
+        .arg(program)
+        .args(args)
+        .process_group(0)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if feed_newlines {
+        cmd.env("KT_FEED_NEWLINES", "1");
+    }
+    let mut child = cmd.spawn()?;
+    let lifeline = child.stdin.take();
+    Ok(Guarded { child, lifeline })
+}
+
+/// Run `make` in the tree, streaming every line into the job log.
+fn make(job: &Arc<Job>, tree: &Path, args: &[&str], jobs: usize) -> Result<(), String> {
+    run_make(job, tree, args, jobs, false)
+}
+
+/// As [`make`], answering "default" to any question kbuild asks on stdin.
+fn make_answering_defaults(
     job: &Arc<Job>,
     tree: &Path,
     args: &[&str],
     jobs: usize,
-    stdin_text: &str,
+) -> Result<(), String> {
+    run_make(job, tree, args, jobs, true)
+}
+
+fn run_make(
+    job: &Arc<Job>,
+    tree: &Path,
+    args: &[&str],
+    jobs: usize,
+    feed_newlines: bool,
 ) -> Result<(), String> {
     let req = &job.request;
-    let mut cmd = Command::new(&req.make);
-    // Its own process group: a parallel build spawns dozens of compilers, and
-    // killing only the top-level make would leave them running (and holding
-    // the output pipe open, so cancelling would appear to hang).
-    cmd.process_group(0)
-        .current_dir(tree)
-        .arg(format!("-j{}", jobs.max(1)))
-        .args(args)
-        .env("LC_ALL", "C")
-        // Keep kbuild from opening an interactive dialog if a new symbol shows up.
-        .env("KCONFIG_NOSILENTUPDATE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
     let llvm = job.llvm.load(Ordering::Relaxed);
+    let mut argv: Vec<String> = vec![format!("-j{}", jobs.max(1))];
+    argv.extend(args.iter().map(|a| a.to_string()));
     if llvm {
-        cmd.arg("LLVM=1");
+        argv.push("LLVM=1".to_string());
     }
+    job.log(&format!("$ {} {}", req.make, argv.join(" ")));
 
-    job.log(&format!(
-        "$ {} -j{} {}{}",
-        req.make,
-        jobs.max(1),
-        args.join(" "),
-        if llvm { " LLVM=1" } else { "" }
-    ));
-
-    let mut child = cmd
-        .spawn()
+    let Guarded {
+        mut child,
+        lifeline,
+    } = spawn_guarded(&req.make, &argv, tree, feed_newlines)
         .map_err(|e| format!("cannot run {}: {e}", req.make))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(stdin_text.as_bytes());
-    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -987,6 +1093,8 @@ fn make_with_stdin(
         }
     };
     *job.child.lock().map_err(|_| "child lock poisoned")? = None;
+    // Only now release the watchdog: the build is over, so it has nothing to kill.
+    drop(lifeline);
 
     if job.cancelled() {
         return Err("cancelled".into());
@@ -1004,22 +1112,43 @@ fn make_with_stdin(
     Ok(())
 }
 
-/// Count compiled objects and name the current phase, for the progress bar.
-fn note_progress(job: &Arc<Job>, line: &str) {
-    let t = line.trim_start();
-    let verb = t.split_whitespace().next().unwrap_or("");
-    let counts = matches!(
-        verb,
-        "CC" | "AS" | "CC_FPIC" | "CC_NOSTDINC" | "AR" | "OBJCOPY" | "RUSTC"
-    );
-    let phase = match verb {
-        "LD" | "LINK" | "LZ4" | "ZSTD" | "GZIP" | "XZ" | "BZIP2" => Some("linking"),
-        "MODPOST" => Some("modules"),
-        "BTF" | "BTFIDS" => Some("btf"),
-        "INSTALL" | "DPKG-DEB" | "RPM" => Some("packaging"),
-        "SIGN" => Some("signing"),
-        _ => None,
+/// What a line of kbuild output says about progress: whether it is a compiled
+/// object, and which phase the build is in.
+///
+/// kbuild prints `LD` for every directory's partial link, so "linking" only
+/// means something when the target is the kernel image itself.
+pub fn classify(line: &str) -> (bool, Option<&'static str>) {
+    let mut words = line.split_whitespace();
+    let verb = words.next().unwrap_or("");
+    let target = words.next().unwrap_or("");
+    let target = if target == "[M]" {
+        words.next().unwrap_or("")
+    } else {
+        target
     };
+    match verb {
+        "CC" | "AS" | "CC_FPIC" | "CC_NOSTDINC" | "RUSTC" => (true, Some("compiling")),
+        "LD" if target.starts_with("vmlinux") || target.starts_with(".tmp_vmlinux") => {
+            (false, Some("linking the kernel image"))
+        }
+        "KSYMS" | "NM" | "SORTTAB" | "SYSMAP" => (false, Some("linking the kernel image")),
+        "MODPOST" => (false, Some("checking modules")),
+        "BTF" | "BTFIDS" => (false, Some("generating BTF")),
+        "ZSTD22" | "ZSTD" | "GZIP" | "XZ_KERN" | "LZ4" | "BZIP2" | "LZMA" | "LZO"
+            if target.contains("/boot/") =>
+        {
+            (false, Some("compressing the image"))
+        }
+        "SIGN" => (false, Some("signing modules")),
+        "INSTALL" => (false, Some("installing")),
+        "DPKG-DEB" | "RPM" | "TAR" => (false, Some("packaging")),
+        _ => (false, None),
+    }
+}
+
+/// Count compiled objects and track the current phase, for the progress bar.
+fn note_progress(job: &Arc<Job>, line: &str) {
+    let (counts, phase) = classify(line);
     if !counts && phase.is_none() {
         return;
     }
@@ -1035,11 +1164,22 @@ fn note_progress(job: &Arc<Job>, line: &str) {
     }
 }
 
-fn collect_artifacts(tree: &Path, output: Output, arch: &str) -> Vec<(String, u64)> {
+/// Find what the build produced.
+///
+/// Package targets write into the tree's parent directory, which usually still
+/// holds packages from earlier builds. Only files written since `since` count,
+/// or the install command would name stale packages alongside the new one.
+pub fn collect_artifacts(
+    tree: &Path,
+    output: Output,
+    arch: &str,
+    since: SystemTime,
+) -> Vec<(String, u64)> {
     let mut out = Vec::new();
-    let mut add = |p: PathBuf| {
+    let mut add = |p: PathBuf, must_be_fresh: bool| {
         if let Ok(meta) = fs::metadata(&p) {
-            if meta.is_file() {
+            let fresh = meta.modified().map(|m| m >= since).unwrap_or(true);
+            if meta.is_file() && (fresh || !must_be_fresh) {
                 out.push((p.to_string_lossy().into_owned(), meta.len()));
             }
         }
@@ -1055,7 +1195,7 @@ fn collect_artifacts(tree: &Path, output: Output, arch: &str) -> Vec<(String, u6
                 "System.map".to_string(),
                 ".config".to_string(),
             ] {
-                add(tree.join(rel));
+                add(tree.join(rel), false);
             }
         }
         Output::Deb | Output::Rpm | Output::Tar => {
@@ -1077,7 +1217,7 @@ fn collect_artifacts(tree: &Path, output: Output, arch: &str) -> Vec<(String, u6
                         .collect();
                     paths.sort();
                     for p in paths {
-                        add(p);
+                        add(p, true);
                     }
                 }
             }
@@ -1090,34 +1230,87 @@ fn collect_artifacts(tree: &Path, output: Output, arch: &str) -> Vec<(String, u6
                                 entries.flatten().map(|e| e.path()).collect();
                             paths.sort();
                             for p in paths {
-                                add(p);
+                                add(p, true);
                             }
                         }
                     }
                 }
             }
-            add(tree.join(".config"));
+            add(tree.join(".config"), false);
         }
     }
     out
 }
 
-/// The exact commands a user should run to install what was just built.
-fn install_steps(tree: &Path, output: Output, artifacts: &[(String, u64)]) -> Vec<String> {
-    let dir = tree.display();
-    match output {
-        Output::Image => vec![
-            format!("sudo make -C {dir} modules_install"),
-            format!("sudo make -C {dir} install"),
-            "sudo update-initramfs -c -k <version>   # Debian/Ubuntu".to_string(),
-            "sudo dracut --force --kver <version>    # Fedora/RHEL".to_string(),
-            "sudo update-grub                        # or: sudo grub2-mkconfig -o /boot/grub2/grub.cfg".to_string(),
-        ],
+/// What the build produced, as far as installing it is concerned.
+pub struct Built<'a> {
+    pub tree: &'a Path,
+    pub output: Output,
+    pub artifacts: &'a [(String, u64)],
+    /// `make kernelrelease`, e.g. `6.12.1-kertweaker`.
+    pub release: &'a str,
+    /// Whether the config has loadable-module support.
+    pub modules: bool,
+    /// `deb`, `rpm`, `arch` or `unknown`.
+    pub family: &'a str,
+}
+
+/// The commands to install what was just built, in order. Lines starting with
+/// `sudo` are commands; anything else is a sentence of explanation.
+pub fn install_steps(b: &Built) -> Vec<String> {
+    let dir = b.tree.display();
+    let ver = if b.release.is_empty() {
+        "<version>"
+    } else {
+        b.release
+    };
+    match b.output {
+        Output::Image => {
+            let mut steps = Vec::new();
+            if b.modules {
+                steps.push(format!("sudo make -C {dir} modules_install"));
+            }
+            steps.push(format!("sudo make -C {dir} install"));
+            match b.family {
+                "deb" => {
+                    steps.push(
+                        "On Debian and Ubuntu that also builds the initramfs and updates GRUB. \
+                         If the new kernel is missing from the boot menu, run these too:"
+                            .to_string(),
+                    );
+                    steps.push(format!("sudo update-initramfs -c -k {ver}"));
+                    steps.push("sudo update-grub".to_string());
+                }
+                "rpm" => {
+                    steps.push(
+                        "On Fedora and RHEL that also builds the initramfs and adds a boot entry. \
+                         If the new kernel is missing from the boot menu, run these too:"
+                            .to_string(),
+                    );
+                    steps.push(format!("sudo dracut --force --kver {ver}"));
+                    steps.push("sudo grub2-mkconfig -o /boot/grub2/grub.cfg".to_string());
+                }
+                "arch" => {
+                    steps.push("Then build an initramfs and refresh the boot menu:".to_string());
+                    steps.push(format!(
+                        "sudo mkinitcpio -k {ver} -g /boot/initramfs-{ver}.img"
+                    ));
+                    steps.push("sudo grub-mkconfig -o /boot/grub/grub.cfg".to_string());
+                }
+                _ => steps.push(
+                    "Then build an initramfs for this kernel and refresh your bootloader's menu, \
+                     the way your distribution does it."
+                        .to_string(),
+                ),
+            }
+            steps
+        }
         Output::Deb => {
-            let debs: Vec<String> = artifacts
+            let debs: Vec<String> = b
+                .artifacts
                 .iter()
                 .map(|(p, _)| p.clone())
-                .filter(|p| p.ends_with(".deb") && !p.contains("-dbg"))
+                .filter(|p| p.ends_with(".deb") && !p.contains("-dbg") && !p.contains("libc-dev"))
                 .collect();
             if debs.is_empty() {
                 vec!["sudo dpkg -i ../linux-image-*.deb ../linux-headers-*.deb".to_string()]
@@ -1125,12 +1318,41 @@ fn install_steps(tree: &Path, output: Output, artifacts: &[(String, u64)]) -> Ve
                 vec![format!("sudo dpkg -i {}", debs.join(" "))]
             }
         }
-        Output::Rpm => vec!["sudo rpm -ivh <the .rpm files listed above>".to_string()],
+        Output::Rpm => {
+            let rpms: Vec<String> = b
+                .artifacts
+                .iter()
+                .map(|(p, _)| p.clone())
+                .filter(|p| p.ends_with(".rpm") && !p.ends_with(".src.rpm"))
+                .collect();
+            if rpms.is_empty() {
+                vec!["sudo rpm -ivh <the kernel .rpm files this build produced>".to_string()]
+            } else {
+                vec![format!("sudo rpm -ivh {}", rpms.join(" "))]
+            }
+        }
         Output::Tar => vec![
             "sudo tar -xf <the tarball above> -C /".to_string(),
-            "sudo depmod -a <version> && sudo update-grub".to_string(),
+            format!("sudo depmod -a {ver}"),
         ],
     }
+}
+
+/// Ask kbuild what this kernel will call itself.
+fn kernel_release(job: &Arc<Job>, tree: &Path) -> String {
+    let mut cmd = Command::new(&job.request.make);
+    cmd.current_dir(tree).args(["-s", "kernelrelease"]);
+    if job.llvm.load(Ordering::Relaxed) {
+        cmd.arg("LLVM=1");
+    }
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        // kbuild can print warnings before the version; the last line is it.
+        .and_then(|s| s.lines().last().map(str::to_string))
+        .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
+        .unwrap_or_default()
 }
 
 /// Remember how many objects the last successful build compiled, so the next
@@ -1180,19 +1402,17 @@ impl Registry {
 
     pub fn start(&self, req: Request) -> Arc<Job> {
         let job = new_job(self.next_id(), req);
-        self.jobs.lock().expect("registry poisoned").push(job.clone());
+        self.jobs
+            .lock()
+            .expect("registry poisoned")
+            .push(job.clone());
         let runner = job.clone();
         thread::spawn(move || run(runner));
         job
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Job>> {
-        self.jobs
-            .lock()
-            .ok()?
-            .iter()
-            .find(|j| j.id == id)
-            .cloned()
+        self.jobs.lock().ok()?.iter().find(|j| j.id == id).cloned()
     }
 
     pub fn all(&self) -> Vec<Arc<Job>> {
@@ -1224,5 +1444,152 @@ pub fn wait(job: &Arc<Job>, timeout: Duration) -> Status {
             return Status::Cancelled;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify, install_steps, Built, Output};
+    use std::path::Path;
+
+    fn built<'a>(
+        output: Output,
+        artifacts: &'a [(String, u64)],
+        modules: bool,
+        family: &'a str,
+    ) -> Built<'a> {
+        Built {
+            tree: Path::new("/src/linux"),
+            output,
+            artifacts,
+            release: "6.12.1-mine",
+            modules,
+            family,
+        }
+    }
+
+    #[test]
+    fn image_install_steps_name_the_real_version() {
+        let steps = install_steps(&built(Output::Image, &[], true, "deb"));
+        assert_eq!(steps[0], "sudo make -C /src/linux modules_install");
+        assert_eq!(steps[1], "sudo make -C /src/linux install");
+        assert!(steps.contains(&"sudo update-initramfs -c -k 6.12.1-mine".to_string()));
+        assert!(!steps.iter().any(|s| s.contains("<version>")));
+
+        let fedora = install_steps(&built(Output::Image, &[], true, "rpm"));
+        assert!(fedora.contains(&"sudo dracut --force --kver 6.12.1-mine".to_string()));
+        let arch = install_steps(&built(Output::Image, &[], true, "arch"));
+        assert!(arch
+            .iter()
+            .any(|s| s.starts_with("sudo mkinitcpio -k 6.12.1-mine")));
+    }
+
+    #[test]
+    fn a_monolithic_kernel_has_no_modules_to_install() {
+        let steps = install_steps(&built(Output::Image, &[], false, "deb"));
+        assert!(
+            !steps.iter().any(|s| s.contains("modules_install")),
+            "{steps:?}"
+        );
+        assert_eq!(steps[0], "sudo make -C /src/linux install");
+    }
+
+    #[test]
+    fn stale_packages_from_earlier_builds_are_ignored() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("kt-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = root.join("linux");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(".config"), "CONFIG_A=y\n").unwrap();
+        std::fs::write(root.join("linux-image-old_amd64.deb"), "old").unwrap();
+
+        // Everything above predates this "build".
+        std::thread::sleep(Duration::from_millis(30));
+        let since = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(root.join("linux-image-new_amd64.deb"), "new").unwrap();
+
+        let found = super::collect_artifacts(&tree, Output::Deb, "x86_64", since);
+        let names: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|p| p.ends_with("linux-image-new_amd64.deb")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|p| p.contains("-old_")), "{names:?}");
+        // The config is always reported, however old.
+        assert!(names.iter().any(|p| p.ends_with(".config")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn package_steps_list_the_files_that_were_built() {
+        let debs = vec![
+            ("/out/linux-image-6.12.1-mine_amd64.deb".to_string(), 1),
+            ("/out/linux-image-6.12.1-mine-dbg_amd64.deb".to_string(), 1),
+            ("/out/linux-headers-6.12.1-mine_amd64.deb".to_string(), 1),
+            ("/out/linux-libc-dev_6.12.1_amd64.deb".to_string(), 1),
+            ("/src/linux/.config".to_string(), 1),
+        ];
+        let steps = install_steps(&built(Output::Deb, &debs, true, "deb"));
+        assert_eq!(
+            steps,
+            vec!["sudo dpkg -i /out/linux-image-6.12.1-mine_amd64.deb /out/linux-headers-6.12.1-mine_amd64.deb"],
+            "debug symbols and libc-dev are not part of installing a kernel"
+        );
+    }
+
+    #[test]
+    fn real_kbuild_lines_are_classified() {
+        // Compiled objects count, including modules.
+        assert_eq!(
+            classify("  CC      kernel/sched/core.o"),
+            (true, Some("compiling"))
+        );
+        assert_eq!(
+            classify("  CC [M]  fs/btrfs/inode.o"),
+            (true, Some("compiling"))
+        );
+        assert_eq!(
+            classify("  AS      arch/x86/entry/entry_64.o"),
+            (true, Some("compiling"))
+        );
+
+        // A per-directory partial link is not "linking the kernel".
+        assert_eq!(
+            classify("  LD      drivers/gpu/drm/built-in.a"),
+            (false, None)
+        );
+        assert_eq!(classify("  LD [M]  fs/xfs/xfs.o"), (false, None));
+        assert_eq!(classify("  AR      kernel/built-in.a"), (false, None));
+
+        // The real final link, and what follows it.
+        assert_eq!(
+            classify("  LD      vmlinux.o"),
+            (false, Some("linking the kernel image"))
+        );
+        assert_eq!(
+            classify("  LD      .tmp_vmlinux.kallsyms1"),
+            (false, Some("linking the kernel image"))
+        );
+        assert_eq!(
+            classify("  MODPOST Module.symvers"),
+            (false, Some("checking modules"))
+        );
+        assert_eq!(
+            classify("  ZSTD22  arch/x86/boot/compressed/vmlinux.bin.zst"),
+            (false, Some("compressing the image"))
+        );
+        assert_eq!(
+            classify("  BTF     .btf.vmlinux.bin.o"),
+            (false, Some("generating BTF"))
+        );
+
+        // Anything else is just log output.
+        assert_eq!(classify("make[2]: Entering directory '/x'"), (false, None));
+        assert_eq!(classify(""), (false, None));
+        assert_eq!(classify("  HOSTCC  scripts/basic/fixdep"), (false, None));
     }
 }

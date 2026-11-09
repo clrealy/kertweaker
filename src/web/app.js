@@ -523,13 +523,15 @@
           p.already_set ? ` ${p.already_set} are already set the way you want.` : ''));
         if (p.changes.length) {
           diffCard.append(h('div', { class: 'table-wrap' }, h('table', {},
-            h('thead', {}, h('tr', {}, h('th', {}, 'Before'), h('th', {}, 'After'), h('th', {}, 'Because of'))),
+            h('thead', {}, h('tr', {}, h('th', {}, 'Because of'), h('th', {}, 'Before'), h('th', {}, 'After'))),
             h('tbody', {}, p.changes.map((c) =>
               h('tr', { class: c.kind },
+                h('td', { class: 'why' }, c.tweak === 'extra_options' ? 'Extra options'
+                  : (tweakById(c.tweak) || {}).title || c.tweak),
                 h('td', { class: 'mono before' }, c.before || '(absent)'),
-                h('td', { class: 'mono after' }, c.after),
-                h('td', {}, c.tweak === 'extra_options' ? 'Extra options'
-                  : (tweakById(c.tweak) || {}).title || c.tweak)))))));
+                h('td', { class: 'mono after' }, c.after)))))));
+          diffCard.append(h('p', { class: 'desc' },
+            'This is your request. kbuild then resolves dependencies, and the build reports anything it changed.'));
           if (p.change_count > p.changes.length) {
             diffCard.append(h('p', { class: 'desc' }, `Showing the first ${p.changes.length} of ${p.change_count}.`));
           }
@@ -544,7 +546,9 @@
       }
       if (r.localmodconfig) {
         diffCard.append(h('div', { class: 'notice caution' }, h('span', { class: 'tag' }, 'Trim'),
-          `Before your tweaks are applied, the config is trimmed to the ${s.loaded_module_count} modules loaded right now. Plug in anything you want supported first.`));
+          s.loaded_module_count
+            ? `Before your tweaks are applied, the config is trimmed to the ${s.loaded_module_count} modules loaded right now. Plug in anything you want supported first.`
+            : 'No modules are loaded on this machine right now, so trimming switches off every driver that is built as a module. That is only right if this kernel already has everything it needs built in.'));
       }
       if (r.symbol_count) {
         diffCard.append(h('details', {},
@@ -628,10 +632,20 @@
           'They can leave this machine unbootable or less secure. I have read the notes above and want to build anyway.')));
     }
 
-    const blocked = s.packages.missing_required.length > 0;
+    const lacking = s.tools.filter((t) => t.output === b.output && !t.found);
+    if (lacking.length) {
+      const pkgs = [...new Set(lacking.map((t) => t.package).filter(Boolean))];
+      const cmd = s.packages.install_prefix && pkgs.length ? `${s.packages.install_prefix} ${pkgs.join(' ')}` : null;
+      out.push(h('div', { class: 'notice error stack' },
+        h('span', {}, h('span', { class: 'tag' }, 'Blocked '),
+          `Building ${b.output === 'deb' ? 'Debian' : 'RPM'} packages needs ${lacking.map((t) => t.tool).join(', ')}, which ${lacking.length === 1 ? 'is' : 'are'} not installed. Install ${lacking.length === 1 ? 'it' : 'them'} and restart kertweaker, or pick "Kernel image + modules".`),
+        cmd ? h('div', { class: 'cmd-row' }, h('code', {}, cmd),
+          h('button', { class: 'btn small', onclick: () => copy(cmd) }, 'Copy')) : null));
+    }
+    const blocked = s.packages.missing_required.length > 0 || lacking.length > 0;
     const busy = S.job && S.job.status === 'running';
     const cannot = (risk === 'risky' && !S.acceptRisk) || busy;
-    if (blocked) {
+    if (s.packages.missing_required.length) {
       out.push(h('div', { class: 'notice error' }, h('span', { class: 'tag' }, 'Blocked'),
         h('span', {}, `Building needs: ${s.packages.missing_required.join(', ')}. You can still write the config. Install command: `,
           h('code', {}, s.packages.install_command || 'see your distribution'))));
@@ -829,8 +843,8 @@
             : null,
           job.next_steps.map((cmd) => cmd.startsWith('sudo ')
             ? h('div', { class: 'cmd-row' }, h('code', {}, cmd),
-                h('button', { class: 'btn small', onclick: () => copy(cmd.split('   #')[0].trim()) }, 'Copy'))
-            : h('p', {}, cmd))));
+                h('button', { class: 'btn small', onclick: () => copy(cmd) }, 'Copy'))
+            : h('p', { class: 'desc' }, cmd))));
       }
     }
     if (job.config_path) {
@@ -879,7 +893,9 @@
     S.selections = sanitizeSelections(S.selections);
     if (!S.build.jobs) S.build.jobs = S.system.suggested_jobs;
     if (!S.build.output) {
-      S.build.output = { deb: 'deb', rpm: 'rpm' }[S.system.package_family] || 'image';
+      const native = { deb: 'deb', rpm: 'rpm' }[S.system.package_family];
+      const usable = native && !S.system.tools.some((t) => t.output === native && !t.found);
+      S.build.output = usable ? native : 'image';
     }
     if (!S.base.mode || (S.base.mode === 'running' && !S.system.running_config)) {
       S.base.mode = S.system.running_config ? 'running' : 'defconfig';

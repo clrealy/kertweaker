@@ -61,15 +61,27 @@ fn full_build_applies_tweaks_and_produces_artifacts() {
     let f = fixture("6.12.3");
     let job = run(request(
         &f,
-        selections(&[("preempt", "full"), ("hz", "1000"), ("localversion", "-kertweaker")]),
+        selections(&[
+            ("preempt", "full"),
+            ("hz", "1000"),
+            ("localversion", "-kertweaker"),
+        ]),
     ));
 
     let st = job.state.lock().unwrap();
-    assert_eq!(st.status, Status::Done, "error: {:?}\n{}", st.error, st.log.join("\n"));
+    assert_eq!(
+        st.status,
+        Status::Done,
+        "error: {:?}\n{}",
+        st.error,
+        st.log.join("\n")
+    );
     drop(st);
 
     // Every stage either ran or was deliberately skipped.
-    for id in ["source", "deps", "base", "tweaks", "resolve", "verify", "build", "collect"] {
+    for id in [
+        "source", "deps", "base", "tweaks", "resolve", "verify", "build", "collect",
+    ] {
         assert_eq!(stage(&job, id).state, StageState::Done, "stage {id}");
     }
     assert_eq!(stage(&job, "trim").state, StageState::Skipped);
@@ -81,11 +93,17 @@ fn full_build_applies_tweaks_and_produces_artifacts() {
     assert_eq!(cfg.get("CONFIG_PREEMPT"), Some("y"));
     assert!(!cfg.enabled("CONFIG_PREEMPT_NONE"));
     assert_eq!(cfg.get("CONFIG_HZ"), Some("1000"));
-    assert_eq!(cfg.string("CONFIG_LOCALVERSION").as_deref(), Some("-kertweaker"));
+    assert_eq!(
+        cfg.string("CONFIG_LOCALVERSION").as_deref(),
+        Some("-kertweaker")
+    );
 
     // Progress accounting and artifacts.
     let st = job.state.lock().unwrap();
-    assert_eq!(st.objects, 13, "12 CC lines plus one OBJCOPY");
+    assert_eq!(
+        st.objects, 12,
+        "one per CC line; LD and OBJCOPY are not objects"
+    );
     assert!(st.diff_count > 0);
     let names: Vec<&str> = st.artifacts.iter().map(|(p, _)| p.as_str()).collect();
     assert!(names.iter().any(|p| p.ends_with("bzImage")), "{names:?}");
@@ -114,13 +132,22 @@ fn verify_reports_options_that_did_not_stick() {
     let st = job.state.lock().unwrap();
     assert_eq!(st.status, Status::Done);
     let symbols: Vec<&str> = st.unapplied.iter().map(|u| u.symbol.as_str()).collect();
-    assert_eq!(symbols, vec!["CONFIG_FORCED_OFF", "CONFIG_NOT_IN_THIS_KERNEL"]);
+    assert_eq!(
+        symbols,
+        vec!["CONFIG_FORCED_OFF", "CONFIG_NOT_IN_THIS_KERNEL"]
+    );
 
     let forced = &st.unapplied[0];
-    assert!(forced.present, "kbuild kept the symbol but changed its value");
+    assert!(
+        forced.present,
+        "kbuild kept the symbol but changed its value"
+    );
     assert_eq!(forced.actual, None);
     let missing = &st.unapplied[1];
-    assert!(!missing.present, "symbol does not exist in this kernel at all");
+    assert!(
+        !missing.present,
+        "symbol does not exist in this kernel at all"
+    );
 
     // The user is told, in the log and in the stage detail.
     drop(st);
@@ -152,7 +179,11 @@ fn modules_built_in_are_reported_as_advice_not_as_failures() {
     assert!(st.unapplied.is_empty(), "{:?}", st.unapplied);
     assert_eq!(st.builtin_instead, vec!["CONFIG_XFS_FS"]);
     assert_eq!(st.advice.len(), 1);
-    assert!(st.advice[0].contains("loadable modules switched off"), "{}", st.advice[0]);
+    assert!(
+        st.advice[0].contains("loadable modules switched off"),
+        "{}",
+        st.advice[0]
+    );
 }
 
 #[test]
@@ -209,7 +240,11 @@ fn missing_source_tree_fails_before_anything_else() {
     let job = run(req);
     let st = job.state.lock().unwrap();
     assert_eq!(st.status, Status::Failed);
-    assert!(st.error.clone().unwrap().contains("not a Linux kernel source tree"));
+    assert!(st
+        .error
+        .clone()
+        .unwrap()
+        .contains("not a Linux kernel source tree"));
     drop(st);
     assert_eq!(stage(&job, "base").state, StageState::Skipped);
 }
@@ -222,7 +257,11 @@ fn an_invalid_version_never_reaches_the_network() {
     let job = run(req);
     let st = job.state.lock().unwrap();
     assert_eq!(st.status, Status::Failed);
-    assert!(st.error.clone().unwrap().contains("not a valid kernel version"));
+    assert!(st
+        .error
+        .clone()
+        .unwrap()
+        .contains("not a valid kernel version"));
 }
 
 #[test]
@@ -258,10 +297,18 @@ fn cancelling_stops_the_running_make() {
 
     // Cancelling must be prompt: if only the top process were killed, the
     // sleeping child would hold the pipe open for its full 120 seconds.
-    assert!(t0.elapsed() < Duration::from_secs(15), "cancel took {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(15),
+        "cancel took {:?}",
+        t0.elapsed()
+    );
     let st = job.state.lock().unwrap();
     assert_eq!(st.status, Status::Cancelled);
-    assert!(st.error.is_none(), "cancelling is not an error: {:?}", st.error);
+    assert!(
+        st.error.is_none(),
+        "cancelling is not an error: {:?}",
+        st.error
+    );
     assert_eq!(stage_of(&st, "build").state, StageState::Skipped);
 }
 
@@ -318,4 +365,97 @@ fn registry_tracks_jobs_and_hands_them_back_by_id() {
     assert!(reg.get(&job.id).is_some());
     assert!(reg.get("nope").is_none());
     assert_ne!(reg.next_id(), reg.next_id());
+}
+
+/// Count live processes whose command line mentions `needle`.
+fn processes_matching(needle: &str) -> usize {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter(|e| {
+            std::fs::read(e.path().join("cmdline"))
+                .map(|c| String::from_utf8_lossy(&c).contains(needle))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+#[test]
+fn the_build_dies_with_kertweaker_instead_of_being_orphaned() {
+    // A "build" that spawns a grandchild and would run for minutes.
+    let dir = std::env::temp_dir().join(format!("kt-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = format!("kt-orphan-marker-{}", std::process::id());
+    let script = format!("sleep 300 & echo started; exec sleep 301 # {marker}");
+
+    let mut guarded = build::spawn_guarded("sh", &["-c".to_string(), script], &dir, false).unwrap();
+
+    // Wait for it to be running.
+    use std::io::{BufRead, BufReader};
+    let mut first = String::new();
+    BufReader::new(guarded.child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert_eq!(first.trim(), "started");
+    assert!(processes_matching(&marker) >= 1);
+
+    // Dropping the lifeline is exactly what happens when kertweaker exits,
+    // crashes or is killed: the write end of the pipe closes.
+    drop(guarded.lifeline.take());
+
+    let t0 = std::time::Instant::now();
+    let status = guarded.child.wait().unwrap();
+    assert!(!status.success(), "the build must have been terminated");
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        t0.elapsed()
+    );
+
+    // Nothing from the build group is left behind, grandchildren included.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while processes_matching(&marker) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        processes_matching(&marker),
+        0,
+        "orphaned build processes remain"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn guarded_commands_pass_arguments_through_untouched() {
+    // Arguments are positional parameters, so shell metacharacters are inert.
+    let dir = std::env::temp_dir();
+    let mut guarded = build::spawn_guarded(
+        "printf",
+        &[
+            "%s|".to_string(),
+            "a b".to_string(),
+            "$(id)".to_string(),
+            "; rm -rf /".to_string(),
+        ],
+        &dir,
+        false,
+    )
+    .unwrap();
+    let mut out = String::new();
+    use std::io::Read;
+    guarded
+        .child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(guarded.child.wait().unwrap().success());
+    assert_eq!(out, "a b|$(id)|; rm -rf /|");
 }

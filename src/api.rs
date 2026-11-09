@@ -74,11 +74,16 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn host_allowed(req: &Request, port: u16) -> bool {
-    let Some(host) = req.header("host") else { return false };
+    let Some(host) = req.header("host") else {
+        return false;
+    };
     [
         format!("127.0.0.1:{port}"),
         format!("localhost:{port}"),
@@ -136,7 +141,11 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Reply {
                     ));
                 }
             }
-            let page = if authed(req, &app.token) { INDEX_HTML } else { LOGIN_HTML };
+            let page = if authed(req, &app.token) {
+                INDEX_HTML
+            } else {
+                LOGIN_HTML
+            };
             return Reply::Full(Response::new(200, "text/html; charset=utf-8", page));
         }
         ("GET", "/app.js") => {
@@ -153,7 +162,10 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Reply {
         return fail(404, "not found");
     }
     if !authed(req, &app.token) {
-        return fail(401, "missing or wrong token - open the URL kertweaker printed");
+        return fail(
+            401,
+            "missing or wrong token - open the URL kertweaker printed",
+        );
     }
     if method == "POST" && !origin_allowed(req, app.port) {
         return fail(403, "cross-origin request refused");
@@ -179,7 +191,11 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Reply {
                         ("id", Json::s(j.id.clone())),
                         (
                             "status",
-                            Json::s(if st.status.finished() { "finished" } else { "running" }),
+                            Json::s(if st.status.finished() {
+                                "finished"
+                            } else {
+                                "running"
+                            }),
                         ),
                         ("started", Json::n(st.started)),
                     ])
@@ -208,12 +224,10 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Reply {
             Some(job) => {
                 let path = job.state.lock().ok().and_then(|s| s.config_path.clone());
                 match path.and_then(|p| fs::read(p).ok()) {
-                    Some(bytes) => Reply::Full(
-                        Response::text(200, bytes).with_header(
-                            "Content-Disposition",
-                            "attachment; filename=\"kertweaker.config\"",
-                        ),
-                    ),
+                    Some(bytes) => Reply::Full(Response::text(200, bytes).with_header(
+                        "Content-Disposition",
+                        "attachment; filename=\"kertweaker.config\"",
+                    )),
                     None => fail(404, "this build has not written a config yet"),
                 }
             }
@@ -351,8 +365,32 @@ fn preview(_app: &Arc<App>, body: &Json) -> Reply {
         _ => None,
     };
 
+    let loaded = parse_base(body).and_then(|b| load_base(&b, tree.as_deref()));
+    if let Ok((base, _)) = &loaded {
+        // A monolithic base turns every "=m" request into "=y". Say so up
+        // front, rather than leaving it as a surprise in the build report.
+        let asks_for_modules = resolved
+            .fragment
+            .iter()
+            .any(|(_, v)| v.as_deref() == Some("m"));
+        let turns_modules_on = resolved
+            .fragment
+            .iter()
+            .any(|(s, v)| s == "CONFIG_MODULES" && v.as_deref() == Some("y"));
+        if asks_for_modules && !base.enabled("CONFIG_MODULES") && !turns_modules_on {
+            resolved.notes.push(catalog::Note {
+                tweak: "modules".into(),
+                level: "caution".into(),
+                text: "The starting config has loadable modules switched off, so everything \
+                       requested as a module will be built into the kernel image instead. Turn on \
+                       'Loadable module support' under Build size & speed to change that."
+                    .into(),
+            });
+        }
+    }
+
     let mut pairs = vec![("resolved", resolved.to_json())];
-    match parse_base(body).and_then(|b| load_base(&b, tree.as_deref())) {
+    match loaded {
         Ok((base, description)) => {
             let mut next = base.clone();
             next.apply(&resolved.fragment);
@@ -385,11 +423,7 @@ fn preview(_app: &Arc<App>, body: &Json) -> Reply {
                                 (
                                     "tweak",
                                     Json::s(
-                                        resolved
-                                            .origin
-                                            .get(&c.symbol)
-                                            .cloned()
-                                            .unwrap_or_default(),
+                                        resolved.origin.get(&c.symbol).cloned().unwrap_or_default(),
                                     ),
                                 ),
                             ])
@@ -412,7 +446,10 @@ fn preview(_app: &Arc<App>, body: &Json) -> Reply {
 
 fn start_build(app: &Arc<App>, body: &Json) -> Reply {
     if app.registry.busy() {
-        return fail(409, "a build is already running - cancel it or wait for it to finish");
+        return fail(
+            409,
+            "a build is already running - cancel it or wait for it to finish",
+        );
     }
     let source = match parse_source(body) {
         Ok(s) => s,
@@ -424,22 +461,34 @@ fn start_build(app: &Arc<App>, body: &Json) -> Reply {
     };
     if let Source::Local(p) = &source {
         if !sources::is_kernel_tree(p) {
-            return fail(400, format!("{} is not a Linux kernel source tree", p.display()));
+            return fail(
+                400,
+                format!("{} is not a Linux kernel source tree", p.display()),
+            );
         }
     }
     if matches!(base, Base::Tree) && !matches!(source, Source::Local(_)) {
-        return fail(400, "a freshly downloaded tree has no .config of its own to start from");
+        return fail(
+            400,
+            "a freshly downloaded tree has no .config of its own to start from",
+        );
     }
 
     let selections = body.string_map("selections");
     let extra = body.str_or("extra", "").to_string();
     let resolved = catalog::resolve_with_extra(&selections, &extra);
     if !resolved.unknown.is_empty() {
-        return fail(400, format!("unknown tweaks: {}", resolved.unknown.join(", ")));
+        return fail(
+            400,
+            format!("unknown tweaks: {}", resolved.unknown.join(", ")),
+        );
     }
     // Options that can cost someone their bootable machine need an explicit yes.
     if resolved.risk == catalog::Risk::Risky && !body.bool_or("accept_risk", false) {
-        return fail(400, "this selection includes risky options - confirm that you accept the risk");
+        return fail(
+            400,
+            "this selection includes risky options - confirm that you accept the risk",
+        );
     }
 
     let jobs = body
@@ -538,7 +587,10 @@ fn list_saved(workdir: &Path) -> Json {
             .collect();
         paths.sort();
         for p in paths {
-            if let Some(j) = fs::read_to_string(&p).ok().and_then(|t| json::parse(&t).ok()) {
+            if let Some(j) = fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| json::parse(&t).ok())
+            {
                 items.push(j);
             }
         }
@@ -548,7 +600,10 @@ fn list_saved(workdir: &Path) -> Json {
 
 fn save_profile(workdir: &Path, body: &Json) -> Reply {
     let Some(name) = safe_name(body.str_or("name", "")) else {
-        return fail(400, "use a name of letters, digits, spaces, dashes or underscores");
+        return fail(
+            400,
+            "use a name of letters, digits, spaces, dashes or underscores",
+        );
     };
     let selections = body.string_map("selections");
     let doc = Json::obj(vec![
@@ -607,7 +662,14 @@ mod tests {
     #[test]
     fn profile_names_cannot_escape_the_directory() {
         assert_eq!(safe_name("my desktop-2").as_deref(), Some("my desktop-2"));
-        for bad in ["", "../etc/passwd", "a/b", ".hidden", "x\0y", &"n".repeat(60)] {
+        for bad in [
+            "",
+            "../etc/passwd",
+            "a/b",
+            ".hidden",
+            "x\0y",
+            &"n".repeat(60),
+        ] {
             assert!(safe_name(bad).is_none(), "{bad:?} must be rejected");
         }
     }

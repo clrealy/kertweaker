@@ -26,7 +26,9 @@ pub struct Request {
 
 impl Request {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_ascii_lowercase()).map(String::as_str)
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
     pub fn cookie(&self, name: &str) -> Option<&str> {
         self.header("cookie")?.split(';').find_map(|pair| {
@@ -210,7 +212,10 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, &'static st
     let mut lines = head.lines();
     let request_line = lines.next().ok_or((400, "empty request"))?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or((400, "malformed request line"))?.to_string();
+    let method = parts
+        .next()
+        .ok_or((400, "malformed request line"))?
+        .to_string();
     let target = parts.next().ok_or((400, "malformed request line"))?;
     if !target.starts_with('/') {
         return Err((400, "only origin-form request targets are supported"));
@@ -225,7 +230,9 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, &'static st
     }
 
     let length = match headers.get("content-length") {
-        Some(v) => v.parse::<usize>().map_err(|_| (400, "bad content-length"))?,
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| (400, "bad content-length"))?,
         None => 0,
     };
     if length > MAX_BODY_BYTES {
@@ -348,7 +355,10 @@ mod tests {
         );
         assert_eq!(roundtrip(huge.as_bytes()).err().unwrap().0, 413);
         assert_eq!(
-            roundtrip(b"GET http://evil/ HTTP/1.1\r\n\r\n").err().unwrap().0,
+            roundtrip(b"GET http://evil/ HTTP/1.1\r\n\r\n")
+                .err()
+                .unwrap()
+                .0,
             400
         );
         assert_eq!(
@@ -358,7 +368,10 @@ mod tests {
                 .0,
             400
         );
-        let long_header = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEADER_BYTES));
+        let long_header = format!(
+            "GET / HTTP/1.1\r\nX: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
         assert_eq!(roundtrip(long_header.as_bytes()).err().unwrap().0, 413);
     }
 }

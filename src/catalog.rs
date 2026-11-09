@@ -225,7 +225,10 @@ impl Tweak {
             ("risk", Json::s(self.risk.as_str())),
             ("docs", Json::s(self.docs)),
             ("tags", Json::strs(self.tags.clone())),
-            ("options", Json::arr(self.opts.iter().map(Opt::to_json).collect())),
+            (
+                "options",
+                Json::arr(self.opts.iter().map(Opt::to_json).collect()),
+            ),
         ])
     }
 }
@@ -513,13 +516,12 @@ fn build_catalog() -> Vec<Tweak> {
                   ("CONFIG_DRM_NOUVEAU", M), ("CONFIG_DRM_SIMPLEDRM", Y), ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
                   ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
             .opt(opt("virtual", "Virtual machine display (virtio-gpu, QXL, bochs, VMware)",
-                "For a VM guest with a graphical console.",
+                "For a VM guest with a graphical console. virtio-gpu also needs 'Run as a VM guest' on.",
                 &[("CONFIG_DRM", Y), ("CONFIG_DRM_VIRTIO_GPU", M), ("CONFIG_DRM_QXL", M),
                   ("CONFIG_DRM_BOCHS", M), ("CONFIG_DRM_VMWGFX", M), ("CONFIG_DRM_AMDGPU", OFF),
                   ("CONFIG_DRM_I915", OFF), ("CONFIG_DRM_NOUVEAU", OFF), ("CONFIG_DRM_SIMPLEDRM", Y),
                   ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
-                  ("CONFIG_FRAMEBUFFER_CONSOLE", Y)])
-                .note("virtio-gpu also needs 'Run as a VM guest' switched on."))
+                  ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
             .opt(opt("headless", "None (headless server)",
                 "No DRM at all. Do not pick this for a machine with a screen.",
                 &[("CONFIG_DRM", OFF), ("CONFIG_DRM_AMDGPU", OFF), ("CONFIG_DRM_I915", OFF),
@@ -1079,7 +1081,9 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
     let mut origin: BTreeMap<String, &str> = BTreeMap::new();
 
     for t in tweaks() {
-        let Some(chosen) = selections.get(t.id) else { continue };
+        let Some(chosen) = selections.get(t.id) else {
+            continue;
+        };
         if chosen.is_empty() || chosen == "keep" {
             continue;
         }
@@ -1167,11 +1171,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
             if existing.1 != value {
                 out.conflicts.push(Conflict {
                     symbol: symbol.clone(),
-                    previous_tweak: origin
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or("?")
-                        .to_string(),
+                    previous_tweak: origin.get(&symbol).copied().unwrap_or("?").to_string(),
                     previous_value: show(&existing.1),
                     winning_tweak: EXTRA.to_string(),
                     winning_value: show(&value),
@@ -1223,7 +1223,12 @@ pub fn fragment_text(fragment: &[(String, Value)]) -> String {
 }
 
 /// Which profile best fits the machine we are running on.
-pub fn profile_hint(hypervisor: bool, memory_gib: f64, threads: usize, has_gui: bool) -> &'static str {
+pub fn profile_hint(
+    hypervisor: bool,
+    memory_gib: f64,
+    threads: usize,
+    has_gui: bool,
+) -> &'static str {
     if hypervisor {
         "vm_guest"
     } else if memory_gib > 0.0 && memory_gib < 8.0 && threads <= 4 {
@@ -1252,7 +1257,10 @@ pub fn to_json() -> Json {
                     .collect(),
             ),
         ),
-        ("tweaks", Json::arr(tweaks().iter().map(Tweak::to_json).collect())),
+        (
+            "tweaks",
+            Json::arr(tweaks().iter().map(Tweak::to_json).collect()),
+        ),
         (
             "profiles",
             Json::arr(
@@ -1455,7 +1463,10 @@ mod tests {
     #[test]
     fn numbers_are_validated() {
         let ok = resolve(&sel(&[("nr_cpus", "16")]));
-        assert_eq!(ok.fragment[0], ("CONFIG_NR_CPUS".to_string(), Some("16".to_string())));
+        assert_eq!(
+            ok.fragment[0],
+            ("CONFIG_NR_CPUS".to_string(), Some("16".to_string()))
+        );
         let bad = resolve(&sel(&[("nr_cpus", "lots")]));
         assert!(bad.fragment.is_empty());
         assert_eq!(bad.notes.len(), 1);
@@ -1470,7 +1481,11 @@ mod tests {
 
     #[test]
     fn tool_requirements_are_tracked_and_reported_when_missing() {
-        let r = resolve(&sel(&[("debug_info", "btf"), ("lto", "thin"), ("preempt", "full")]));
+        let r = resolve(&sel(&[
+            ("debug_info", "btf"),
+            ("lto", "thin"),
+            ("preempt", "full"),
+        ]));
         let tools: Vec<&str> = r.needs.iter().map(|n| n.tool).collect();
         assert_eq!(tools, vec!["pahole", "clang", "ld.lld"]);
         assert!(r.needs_clang());

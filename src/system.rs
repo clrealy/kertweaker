@@ -12,30 +12,86 @@ pub struct ToolSpec {
     pub deb: Option<&'static str>,
     pub rpm: Option<&'static str>,
     pub arch: Option<&'static str>,
+    /// A normal build fails without it.
     pub required: bool,
+    /// Set when the tool is only needed for one output format (`deb`, `rpm`).
+    pub output: Option<&'static str>,
 }
 
-/// What kbuild needs on the PATH. `required` means a normal build fails without it.
+impl ToolSpec {
+    /// The package that ships this tool on the given distro family.
+    pub fn package(&self, family: &str) -> Option<&'static str> {
+        match family {
+            "deb" => self.deb,
+            "rpm" => self.rpm,
+            "arch" => self.arch,
+            _ => None,
+        }
+    }
+}
+
+type S = &'static str;
+
+const fn spec(
+    tool: S,
+    why: S,
+    deb: S,
+    rpm: S,
+    arch: S,
+    required: bool,
+    output: Option<S>,
+) -> ToolSpec {
+    ToolSpec {
+        tool,
+        why,
+        deb: Some(deb),
+        rpm: Some(rpm),
+        arch: Some(arch),
+        required,
+        output,
+    }
+}
+/// Every kernel build needs it.
+const fn required(tool: S, why: S, deb: S, rpm: S, arch: S) -> ToolSpec {
+    spec(tool, why, deb, rpm, arch, true, None)
+}
+/// Only some selections need it.
+const fn optional(tool: S, why: S, deb: S, rpm: S, arch: S) -> ToolSpec {
+    spec(tool, why, deb, rpm, arch, false, None)
+}
+/// Only one output format needs it.
+const fn only_for(output: S, tool: S, why: S, deb: S, rpm: S, arch: S) -> ToolSpec {
+    spec(tool, why, deb, rpm, arch, false, Some(output))
+}
+
+/// What kbuild needs on the PATH, and the package that provides each tool on
+/// Debian-, Red Hat- and Arch-family distributions.
+#[rustfmt::skip]
 pub const BUILD_TOOLS: &[ToolSpec] = &[
-    ToolSpec { tool: "gcc", why: "compiles the kernel", deb: Some("gcc"), rpm: Some("gcc"), arch: Some("gcc"), required: true },
-    ToolSpec { tool: "make", why: "drives kbuild", deb: Some("make"), rpm: Some("make"), arch: Some("make"), required: true },
-    ToolSpec { tool: "ld", why: "links the kernel image", deb: Some("binutils"), rpm: Some("binutils"), arch: Some("binutils"), required: true },
-    ToolSpec { tool: "flex", why: "builds the kconfig parser", deb: Some("flex"), rpm: Some("flex"), arch: Some("flex"), required: true },
-    ToolSpec { tool: "bison", why: "builds the kconfig parser", deb: Some("bison"), rpm: Some("bison"), arch: Some("bison"), required: true },
-    ToolSpec { tool: "bc", why: "computes timeconst.h", deb: Some("bc"), rpm: Some("bc"), arch: Some("bc"), required: true },
-    ToolSpec { tool: "openssl", why: "module signing and certificates", deb: Some("libssl-dev"), rpm: Some("openssl-devel"), arch: Some("openssl"), required: true },
-    ToolSpec { tool: "tar", why: "unpacks kernel tarballs", deb: Some("tar"), rpm: Some("tar"), arch: Some("tar"), required: true },
-    ToolSpec { tool: "xz", why: "decompresses kernel tarballs", deb: Some("xz-utils"), rpm: Some("xz"), arch: Some("xz"), required: true },
-    ToolSpec { tool: "gzip", why: "reads /proc/config.gz", deb: Some("gzip"), rpm: Some("gzip"), arch: Some("gzip"), required: true },
-    ToolSpec { tool: "depmod", why: "installs modules", deb: Some("kmod"), rpm: Some("kmod"), arch: Some("kmod"), required: true },
-    ToolSpec { tool: "curl", why: "downloads kernel tarballs", deb: Some("curl"), rpm: Some("curl"), arch: Some("curl"), required: false },
-    ToolSpec { tool: "pahole", why: "only for CONFIG_DEBUG_INFO_BTF", deb: Some("dwarves"), rpm: Some("dwarves"), arch: Some("pahole"), required: false },
-    ToolSpec { tool: "clang", why: "only for LTO or CFI builds", deb: Some("clang"), rpm: Some("clang"), arch: Some("clang"), required: false },
-    ToolSpec { tool: "ld.lld", why: "linker for clang LTO builds", deb: Some("lld"), rpm: Some("lld"), arch: Some("lld"), required: false },
-    ToolSpec { tool: "zstd", why: "zstd-compressed images and modules", deb: Some("zstd"), rpm: Some("zstd"), arch: Some("zstd"), required: false },
-    ToolSpec { tool: "cpio", why: "initramfs generation", deb: Some("cpio"), rpm: Some("cpio"), arch: Some("cpio"), required: false },
-    ToolSpec { tool: "dpkg-deb", why: "only for .deb package output", deb: Some("dpkg-dev"), rpm: None, arch: None, required: false },
-    ToolSpec { tool: "rpmbuild", why: "only for .rpm package output", deb: None, rpm: Some("rpm-build"), arch: None, required: false },
+    required("gcc", "compiles the kernel", "gcc", "gcc", "gcc"),
+    required("make", "drives kbuild", "make", "make", "make"),
+    required("ld", "links the kernel image", "binutils", "binutils", "binutils"),
+    required("flex", "builds the kconfig parser", "flex", "flex", "flex"),
+    required("bison", "builds the kconfig parser", "bison", "bison", "bison"),
+    required("bc", "computes timeconst.h", "bc", "bc", "bc"),
+    required("openssl", "module signing and certificates", "libssl-dev", "openssl-devel", "openssl"),
+    required("tar", "unpacks kernel tarballs", "tar", "tar", "tar"),
+    required("xz", "decompresses kernel tarballs", "xz-utils", "xz", "xz"),
+    required("gzip", "reads /proc/config.gz", "gzip", "gzip", "gzip"),
+    required("depmod", "installs modules", "kmod", "kmod", "kmod"),
+    optional("curl", "downloads kernel tarballs", "curl", "curl", "curl"),
+    optional("pahole", "only for CONFIG_DEBUG_INFO_BTF", "dwarves", "dwarves", "pahole"),
+    optional("clang", "only for LTO builds", "clang", "clang", "clang"),
+    optional("ld.lld", "linker for clang LTO builds", "lld", "lld", "lld"),
+    optional("zstd", "zstd-compressed images and modules", "zstd", "zstd", "zstd"),
+    optional("lz4", "lz4-compressed kernel images", "lz4", "lz4", "lz4"),
+    optional("cpio", "initramfs generation", "cpio", "cpio", "cpio"),
+    // `make bindeb-pkg` runs dpkg-buildpackage, which reads the generated
+    // debian/control and refuses to start without debhelper and rsync.
+    only_for("deb", "dpkg-buildpackage", "builds .deb packages", "dpkg-dev", "dpkg-dev", "dpkg"),
+    only_for("deb", "dh", "debhelper, used by the kernel's debian/rules", "debhelper", "debhelper", "debhelper"),
+    only_for("deb", "rsync", "copies headers into the .deb", "rsync", "rsync", "rsync"),
+    only_for("rpm", "rpmbuild", "builds .rpm packages", "rpm", "rpm-build", "rpm-tools"),
 ];
 
 /// Headers with no binary to probe for, so they are always in the install line.
@@ -82,10 +138,7 @@ pub fn os_release() -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for line in read("/etc/os-release").lines() {
         if let Some((k, v)) = line.split_once('=') {
-            map.insert(
-                k.trim().to_string(),
-                v.trim().trim_matches('"').to_string(),
-            );
+            map.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
         }
     }
     map
@@ -134,7 +187,9 @@ pub fn cpu() -> Cpu {
     let mut vendor = String::new();
     let mut flags = String::new();
     for line in text.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         match k {
             "model name" if model.is_empty() => model = v.to_string(),
@@ -145,7 +200,11 @@ pub fn cpu() -> Cpu {
         }
     }
     Cpu {
-        model: if model.is_empty() { "unknown".into() } else { model },
+        model: if model.is_empty() {
+            "unknown".into()
+        } else {
+            model
+        },
         vendor,
         threads: std::thread::available_parallelism()
             .map(|n| n.get())
@@ -226,9 +285,7 @@ pub fn running_config_path() -> Option<PathBuf> {
 pub fn bootloader() -> &'static str {
     if Path::new("/boot/grub").is_dir() || Path::new("/boot/grub2").is_dir() {
         "grub"
-    } else if Path::new("/boot/loader/entries").is_dir() {
-        "systemd-boot"
-    } else if which("bootctl").is_some() {
+    } else if Path::new("/boot/loader/entries").is_dir() || which("bootctl").is_some() {
         "systemd-boot"
     } else {
         "unknown"
@@ -265,7 +322,10 @@ pub fn loaded_modules() -> Vec<String> {
 fn has_gui() -> bool {
     Path::new("/sys/class/drm").is_dir()
         && fs::read_dir("/sys/class/drm")
-            .map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("card")))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("card"))
+            })
             .unwrap_or(false)
 }
 
@@ -303,18 +363,13 @@ pub fn missing_packages(report: &[ToolStatus]) -> Packages {
     let mut pkgs: Vec<&str> = Vec::new();
 
     for item in report.iter().filter(|i| !i.found) {
-        let pkg = match family {
-            "deb" => item.spec.deb,
-            "rpm" => item.spec.rpm,
-            "arch" => item.spec.arch,
-            _ => None,
-        };
         if item.spec.required {
             missing_required.push(item.spec.tool);
-            if let Some(p) = pkg {
+            if let Some(p) = item.spec.package(family) {
                 pkgs.push(p);
             }
-        } else {
+        } else if item.spec.output.is_none() {
+            // Output-format tools are reported against the format that needs them.
             missing_optional.push(item.spec.tool);
         }
     }
@@ -328,18 +383,50 @@ pub fn missing_packages(report: &[ToolStatus]) -> Packages {
     pkgs.dedup();
     pkgs.extend_from_slice(extras);
 
-    let install_command = match family {
-        "deb" => Some(format!("sudo apt install -y {}", pkgs.join(" "))),
-        "rpm" => Some(format!("sudo dnf install -y {}", pkgs.join(" "))),
-        "arch" => Some(format!("sudo pacman -S --needed {}", pkgs.join(" "))),
-        _ => None,
-    };
+    let install_command = install_prefix(family).map(|p| format!("{p} {}", pkgs.join(" ")));
 
     Packages {
         family,
         missing_required,
         missing_optional,
         install_command,
+    }
+}
+
+/// The command that installs packages on this distro family.
+pub fn install_prefix(family: &str) -> Option<&'static str> {
+    match family {
+        "deb" => Some("sudo apt install -y"),
+        "rpm" => Some("sudo dnf install -y"),
+        "arch" => Some("sudo pacman -S --needed"),
+        _ => None,
+    }
+}
+
+/// Tools a given output format needs that are not installed, and how to get them.
+pub struct OutputTools {
+    pub missing: Vec<&'static str>,
+    pub install_command: Option<String>,
+}
+
+pub fn output_tools(output: &str, report: &[ToolStatus]) -> OutputTools {
+    let family = package_family();
+    let lacking: Vec<&ToolStatus> = report
+        .iter()
+        .filter(|t| t.spec.output == Some(output) && !t.found)
+        .collect();
+    let mut pkgs: Vec<&str> = lacking
+        .iter()
+        .filter_map(|t| t.spec.package(family))
+        .collect();
+    pkgs.sort();
+    pkgs.dedup();
+    OutputTools {
+        missing: lacking.iter().map(|t| t.spec.tool).collect(),
+        install_command: match (install_prefix(family), pkgs.is_empty()) {
+            (Some(prefix), false) => Some(format!("{prefix} {}", pkgs.join(" "))),
+            _ => None,
+        },
     }
 }
 
@@ -417,7 +504,10 @@ pub fn describe(workdir: &Path) -> Json {
                     .unwrap_or_else(|| "unknown".into()),
             ),
         ),
-        ("distro_id", Json::s(os.get("ID").cloned().unwrap_or_default())),
+        (
+            "distro_id",
+            Json::s(os.get("ID").cloned().unwrap_or_default()),
+        ),
         ("package_family", Json::s(pkgs.family)),
         ("running_kernel", Json::s(uname("-r"))),
         ("machine", Json::s(uname("-m"))),
@@ -449,7 +539,7 @@ pub fn describe(workdir: &Path) -> Json {
                 None => Json::Null,
             },
         ),
-        ("is_root", Json::b(uname("-n") != "\u{0}" && is_root())),
+        ("is_root", Json::b(is_root())),
         ("has_gui", Json::b(gui)),
         (
             "suggested_profile",
@@ -471,6 +561,8 @@ pub fn describe(workdir: &Path) -> Json {
                             ("tool", Json::s(t.spec.tool)),
                             ("why", Json::s(t.spec.why)),
                             ("required", Json::b(t.spec.required)),
+                            ("output", Json::opt_s(t.spec.output)),
+                            ("package", Json::opt_s(t.spec.package(pkgs.family))),
                             ("found", Json::b(t.found)),
                             (
                                 "path",
@@ -487,9 +579,16 @@ pub fn describe(workdir: &Path) -> Json {
             "packages",
             Json::obj(vec![
                 ("family", Json::s(pkgs.family)),
-                ("missing_required", Json::strs(pkgs.missing_required.clone())),
-                ("missing_optional", Json::strs(pkgs.missing_optional.clone())),
+                (
+                    "missing_required",
+                    Json::strs(pkgs.missing_required.clone()),
+                ),
+                (
+                    "missing_optional",
+                    Json::strs(pkgs.missing_optional.clone()),
+                ),
                 ("install_command", Json::opt_s(pkgs.install_command.clone())),
+                ("install_prefix", Json::opt_s(install_prefix(pkgs.family))),
             ]),
         ),
         (
@@ -498,10 +597,7 @@ pub fn describe(workdir: &Path) -> Json {
                 warnings(&report, workdir)
                     .into_iter()
                     .map(|w| {
-                        Json::obj(vec![
-                            ("level", Json::s(w.level)),
-                            ("text", Json::s(w.text)),
-                        ])
+                        Json::obj(vec![("level", Json::s(w.level)), ("text", Json::s(w.text))])
                     })
                     .collect(),
             ),
@@ -560,8 +656,17 @@ mod tests {
     fn describe_produces_the_fields_the_ui_reads() {
         let j = describe(Path::new("/tmp"));
         for key in [
-            "hostname", "distro", "running_kernel", "arch", "cpu", "memory_gib",
-            "free_disk_gib", "tools", "packages", "warnings", "suggested_jobs",
+            "hostname",
+            "distro",
+            "running_kernel",
+            "arch",
+            "cpu",
+            "memory_gib",
+            "free_disk_gib",
+            "tools",
+            "packages",
+            "warnings",
+            "suggested_jobs",
             "suggested_profile",
         ] {
             assert!(j.get(key).is_some(), "describe() is missing {key}");
@@ -582,6 +687,39 @@ mod tests {
             // Header packages are always included.
             assert!(cmd.contains("elf"), "{cmd}");
         }
+    }
+
+    #[test]
+    fn output_formats_declare_their_own_tools() {
+        let deb: Vec<&str> = BUILD_TOOLS
+            .iter()
+            .filter(|t| t.output == Some("deb"))
+            .map(|t| t.tool)
+            .collect();
+        // What `make bindeb-pkg` actually refuses to run without.
+        assert_eq!(deb, vec!["dpkg-buildpackage", "dh", "rsync"]);
+        assert!(BUILD_TOOLS.iter().any(|t| t.output == Some("rpm")));
+        // Format-specific tools never block an ordinary build.
+        assert!(BUILD_TOOLS
+            .iter()
+            .filter(|t| t.output.is_some())
+            .all(|t| !t.required));
+
+        // A host with none of them is told which packages to install.
+        let report: Vec<ToolStatus> = BUILD_TOOLS
+            .iter()
+            .map(|spec| ToolStatus {
+                spec,
+                found: false,
+                path: None,
+            })
+            .collect();
+        let need = output_tools("deb", &report);
+        assert_eq!(need.missing, vec!["dpkg-buildpackage", "dh", "rsync"]);
+        if let Some(cmd) = need.install_command {
+            assert!(cmd.contains("debhelper") && cmd.contains("rsync"), "{cmd}");
+        }
+        assert!(output_tools("image", &report).missing.is_empty());
     }
 
     #[test]

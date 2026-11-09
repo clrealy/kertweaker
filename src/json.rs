@@ -112,12 +112,6 @@ impl Json {
     }
 
     // ------------------------------------------------------------- rendering
-    pub fn to_string(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out);
-        out
-    }
-
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -158,6 +152,14 @@ impl Json {
                 out.push('}');
             }
         }
+    }
+}
+
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = String::new();
+        self.write(&mut out);
+        f.write_str(&out)
     }
 }
 
@@ -352,11 +354,8 @@ impl<'a> Parser<'a> {
                                     self.i += 1;
                                     self.eat(b'u')?;
                                     let lo = self.hex4()?;
-                                    let combined =
-                                        0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                    out.push(
-                                        char::from_u32(combined).ok_or("bad surrogate pair")?,
-                                    );
+                                    let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    out.push(char::from_u32(combined).ok_or("bad surrogate pair")?);
                                 } else {
                                     out.push('\u{fffd}');
                                 }
@@ -436,7 +435,13 @@ mod tests {
         assert_eq!(v.get("s").unwrap().as_str().unwrap(), "a\"b\né😀");
         assert_eq!(v.get("n").unwrap().as_f64().unwrap(), -150.0);
         assert_eq!(
-            v.get("o").unwrap().get("k").unwrap().as_array().unwrap().len(),
+            v.get("o")
+                .unwrap()
+                .get("k")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             2
         );
     }

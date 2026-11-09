@@ -8,8 +8,9 @@ use crate::json::{self, Json};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 pub const CDN: &str = "https://cdn.kernel.org/pub/linux/kernel";
@@ -36,7 +37,8 @@ pub fn tarball_url(version: &str) -> String {
 pub fn valid_version(v: &str) -> bool {
     !v.is_empty()
         && v.len() < 32
-        && v.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
+        && v.bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
         && v.bytes().next().is_some_and(|b| b.is_ascii_digit())
         && !v.contains("..")
 }
@@ -103,9 +105,9 @@ pub fn releases(cache_dir: &Path) -> Json {
         }
     }
 
-    match fetch(RELEASES_URL, 20).and_then(|b| {
-        json::parse(&String::from_utf8_lossy(&b)).map_err(io::Error::other)
-    }) {
+    match fetch(RELEASES_URL, 20)
+        .and_then(|b| json::parse(&String::from_utf8_lossy(&b)).map_err(io::Error::other))
+    {
         Ok(data) => {
             let list: Vec<Json> = data
                 .get("releases")
@@ -192,11 +194,10 @@ pub fn tree_version(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path.join("Makefile")).ok()?;
     let head: String = text.lines().take(60).collect::<Vec<_>>().join("\n");
     let field = |key: &str| -> Option<String> {
-        head.lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once('=')?;
-                (k.trim() == key).then(|| v.trim().to_string())
-            })
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == key).then(|| v.trim().to_string())
+        })
     };
     let version = field("VERSION")?;
     let patch = field("PATCHLEVEL")?;
@@ -265,51 +266,96 @@ pub fn default_search_dirs(workdir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Stream a tarball to `dest_dir`, reporting progress lines as curl emits them.
+/// Download a tarball into `dest_dir`, logging progress and honouring `cancel`.
+///
+/// The transfer lands in a `.part` file that is renamed only on success, so an
+/// interrupted download is never mistaken for a complete tarball.
 pub fn download(
     url: &str,
     dest_dir: &Path,
     log: &mut dyn FnMut(&str),
+    cancel: &AtomicBool,
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(dest_dir)?;
     let name = url
         .rsplit('/')
         .next()
-        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']))
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && *n != "." && *n != "..")
         .ok_or_else(|| io::Error::other("cannot derive a filename from the URL"))?;
     let dest = dest_dir.join(name);
-    if dest.is_file() {
-        let size = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-        if size > 1024 {
+    if let Ok(meta) = fs::metadata(&dest) {
+        if meta.is_file() && meta.len() > 1024 {
             log(&format!(
-                "Reusing downloaded tarball {} ({:.1} MiB)",
+                "Reusing downloaded {} ({:.1} MiB)",
                 dest.display(),
-                size as f64 / 1024.0 / 1024.0
+                meta.len() as f64 / 1048576.0
             ));
             return Ok(dest);
         }
     }
-    let part = dest.with_extension("part");
+
+    let part = dest_dir.join(format!("{name}.part"));
+    let _ = fs::remove_file(&part);
     log(&format!("Downloading {url}"));
-    let status = if crate::system::which("curl").is_some() {
-        Command::new("curl")
-            .args(["-fL", "--retry", "3", "--progress-bar", "-o"])
-            .arg(&part)
-            .arg(url)
-            .status()?
+
+    let mut cmd = if crate::system::which("curl").is_some() {
+        let mut c = Command::new("curl");
+        c.args(["-fsSL", "--retry", "3", "-o"]).arg(&part).arg(url);
+        c
+    } else if crate::system::which("wget").is_some() {
+        let mut c = Command::new("wget");
+        c.args(["-q", "-O"]).arg(&part).arg(url);
+        c
     } else {
-        Command::new("wget")
-            .args(["-q", "--show-progress", "-O"])
-            .arg(&part)
-            .arg(url)
-            .status()?
+        return Err(io::Error::other(
+            "no curl or wget available to download with",
+        ));
     };
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Poll rather than block, so the log shows progress and a cancel is prompt.
+    let mut last_report = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&part);
+            return Err(io::Error::other("download cancelled"));
+        }
+        if last_report.elapsed() >= Duration::from_secs(3) {
+            let bytes = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            log(&format!("  {:.0} MiB downloaded", bytes as f64 / 1048576.0));
+            last_report = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+
     if !status.success() {
+        let mut detail = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut detail);
+        }
         let _ = fs::remove_file(&part);
-        return Err(io::Error::other(format!("download failed: {url}")));
+        return Err(io::Error::other(format!(
+            "could not download {url}: {}",
+            detail.trim().lines().last().unwrap_or("transfer failed")
+        )));
     }
     fs::rename(&part, &dest)?;
-    log(&format!("Saved {}", dest.display()));
+    let size = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    log(&format!(
+        "Saved {} ({:.1} MiB)",
+        dest.display(),
+        size as f64 / 1048576.0
+    ));
     Ok(dest)
 }
 
@@ -318,7 +364,11 @@ pub fn extract(tarball: &Path, dest_dir: &Path, log: &mut dyn FnMut(&str)) -> io
     fs::create_dir_all(dest_dir)?;
     let stem = tarball
         .file_name()
-        .map(|n| n.to_string_lossy().replace(".tar.xz", "").replace(".tar.gz", ""))
+        .map(|n| {
+            n.to_string_lossy()
+                .replace(".tar.xz", "")
+                .replace(".tar.gz", "")
+        })
         .unwrap_or_default();
     let expected = dest_dir.join(&stem);
     if expected.is_dir() && is_kernel_tree(&expected) {
@@ -376,8 +426,15 @@ mod tests {
         assert!(valid_version("6.12.1"));
         assert!(valid_version("6.1"));
         for bad in [
-            "", "../../etc", "6.12.1; rm -rf /", "$(id)", "v6.12", "6.12.1/../x",
-            "6..1", "&&whoami", "6.12.1 --upload-file",
+            "",
+            "../../etc",
+            "6.12.1; rm -rf /",
+            "$(id)",
+            "v6.12",
+            "6.12.1/../x",
+            "6..1",
+            "&&whoami",
+            "6.12.1 --upload-file",
         ] {
             assert!(!valid_version(bad), "{bad:?} must be rejected");
         }
@@ -412,6 +469,54 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         fs::write(dir.join("Makefile"), "all:\n\tcargo build\n").unwrap();
         assert_eq!(tree_version(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_is_atomic_reusable_and_cancellable() {
+        if crate::system::which("curl").is_none() {
+            return; // nothing to drive the transfer with on this host
+        }
+        let dir = std::env::temp_dir().join(format!("kt-dl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("origin")).unwrap();
+        let origin = dir.join("origin/linux-9.9.tar.xz");
+        fs::write(&origin, vec![7u8; 4096]).unwrap();
+        let url = format!("file://{}", origin.display());
+        let dest_dir = dir.join("downloads");
+        let never = AtomicBool::new(false);
+
+        let mut lines = Vec::new();
+        let got = download(&url, &dest_dir, &mut |l| lines.push(l.to_string()), &never).unwrap();
+        assert_eq!(got, dest_dir.join("linux-9.9.tar.xz"));
+        assert_eq!(fs::read(&got).unwrap().len(), 4096);
+        assert!(!dest_dir.join("linux-9.9.tar.xz.part").exists());
+        assert!(lines.iter().any(|l| l.starts_with("Saved ")), "{lines:?}");
+
+        // A second request reuses the file instead of fetching again.
+        let mut lines = Vec::new();
+        download(&url, &dest_dir, &mut |l| lines.push(l.to_string()), &never).unwrap();
+        assert!(lines[0].starts_with("Reusing downloaded"), "{lines:?}");
+
+        // A failed transfer reports why and leaves nothing half-written behind.
+        let missing = format!("file://{}/nope.tar.xz", dir.display());
+        let err = download(&missing, &dest_dir, &mut |_| {}, &never).unwrap_err();
+        assert!(err.to_string().contains("could not download"), "{err}");
+        assert!(!dest_dir.join("nope.tar.xz").exists());
+        assert!(!dest_dir.join("nope.tar.xz.part").exists());
+
+        // Already cancelled: the transfer is stopped and cleaned up.
+        fs::write(dir.join("origin/other.tar.xz"), vec![1u8; 4096]).unwrap();
+        let other = format!("file://{}/origin/other.tar.xz", dir.display());
+        let cancelled = AtomicBool::new(true);
+        let result = download(&other, &dest_dir, &mut |_| {}, &cancelled);
+        // curl may win the race on a tiny local file; either outcome must be clean.
+        if let Err(e) = result {
+            assert!(e.to_string().contains("cancelled"), "{e}");
+            assert!(!dest_dir.join("other.tar.xz").exists());
+        }
+        assert!(!dest_dir.join("other.tar.xz.part").exists());
+
         let _ = fs::remove_dir_all(&dir);
     }
 

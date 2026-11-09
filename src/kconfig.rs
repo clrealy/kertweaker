@@ -243,7 +243,11 @@ pub fn parse_fragment(text: &str) -> Vec<(String, Value)> {
         let Some((sym, val)) = parsed else { continue };
         // kbuild never writes "=n", so in a hand-written fragment it can only
         // mean "turn this off".
-        let val = if val.as_deref() == Some("n") { None } else { val };
+        let val = if val.as_deref() == Some("n") {
+            None
+        } else {
+            val
+        };
         if let Some(slot) = out.iter_mut().find(|(s, _)| s == sym) {
             slot.1 = val;
         } else {
@@ -478,7 +482,10 @@ mod tests {
     fn set_edits_in_place_and_appends() {
         let mut c = Config::parse(SAMPLE);
         assert!(c.set("CONFIG_B", Some("m".into())));
-        assert!(!c.set("CONFIG_B", Some("m".into())), "no-op must report false");
+        assert!(
+            !c.set("CONFIG_B", Some("m".into())),
+            "no-op must report false"
+        );
         assert!(c.set("CONFIG_NEW", Some("y".into())));
         let text = c.render();
         assert!(text.contains("CONFIG_B=m"));
@@ -554,7 +561,10 @@ mod tests {
         let text = c.render();
         let perf = text.find("CONFIG_GOV_PERFORMANCE=y").unwrap();
         let user = text.find("CONFIG_GOV_USERSPACE=y").unwrap();
-        assert!(perf > user, "the request must come last so kconfig prefers it:\n{text}");
+        assert!(
+            perf > user,
+            "the request must come last so kconfig prefers it:\n{text}"
+        );
         assert!(!text.contains("# CONFIG_GOV_PERFORMANCE is not set"));
         assert_eq!(text.matches("CONFIG_OTHER=y").count(), 1);
         // Index is rebuilt, so later edits still work.

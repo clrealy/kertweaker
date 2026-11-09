@@ -105,7 +105,11 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" | "help" => args.command = "help".into(),
             "-V" | "--version" => args.command = "version".into(),
             "--port" => {
-                args.port = Some(value("--port")?.parse().map_err(|_| "--port needs a number")?)
+                args.port = Some(
+                    value("--port")?
+                        .parse()
+                        .map_err(|_| "--port needs a number")?,
+                )
             }
             "--no-open" => args.open = false,
             "--workdir" => args.workdir = PathBuf::from(value("--workdir")?),
@@ -121,7 +125,11 @@ fn parse_args() -> Result<Args, String> {
             "--base" => args.base = value("--base")?,
             "--output" => args.output = value("--output")?,
             "-j" | "--jobs" => {
-                args.jobs = Some(value("--jobs")?.parse().map_err(|_| "--jobs needs a number")?)
+                args.jobs = Some(
+                    value("--jobs")?
+                        .parse()
+                        .map_err(|_| "--jobs needs a number")?,
+                )
             }
             "--config-only" => args.config_only = true,
             "--clang" => args.clang = true,
@@ -209,7 +217,7 @@ fn cmd_gui(args: &Args) -> Result<(), String> {
     println!("  Open:     {url}");
     println!("  Workdir:  {}", args.workdir.display());
     println!();
-    println!("The link carries a one-time access token; it only works from this machine.");
+    println!("The link carries this run's access token and only works from this machine.");
     println!("Press Ctrl+C to stop.");
 
     if args.open && open_browser(&url) {
@@ -217,8 +225,10 @@ fn cmd_gui(args: &Args) -> Result<(), String> {
     }
 
     let handler_app = app.clone();
-    http::serve(listener, move |req| -> Reply { api::handle(&handler_app, req) })
-        .map_err(|e| e.to_string())
+    http::serve(listener, move |req| -> Reply {
+        api::handle(&handler_app, req)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Best effort: only when there is a desktop session to open a browser in.
@@ -245,7 +255,9 @@ fn cmd_doctor(args: &Args) -> Result<(), String> {
     println!("Machine");
     println!(
         "  distro      {}",
-        os.get("PRETTY_NAME").cloned().unwrap_or_else(|| "unknown".into())
+        os.get("PRETTY_NAME")
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     );
     println!("  kernel      {}", system::uname("-r"));
     println!("  cpu         {} ({} threads)", cpu.model, cpu.threads);
@@ -282,14 +294,22 @@ fn cmd_doctor(args: &Args) -> Result<(), String> {
             "absent "
         };
         println!(
-            "  {mark} {:<9} {}{}",
+            "  {mark} {:<17} {}{}",
             t.spec.tool,
             t.spec.why,
-            if t.spec.required { "" } else { " (optional)" }
+            match (t.spec.required, t.spec.output) {
+                (true, _) => String::new(),
+                (false, Some(out)) => format!(" (only for .{out} output)"),
+                (false, None) => " (optional)".to_string(),
+            }
         );
     }
     let pkgs = system::missing_packages(&report);
     println!();
+    let native = system::output_tools(pkgs.family, &report);
+    if let (false, Some(cmd)) = (native.missing.is_empty(), native.install_command) {
+        println!("For .{} package output, also run:\n  {cmd}\n", pkgs.family);
+    }
     if pkgs.missing_required.is_empty() {
         println!("Ready to build.");
         Ok(())
@@ -310,7 +330,11 @@ fn cmd_profiles() {
     for p in catalog::PROFILES {
         println!("{:<12} {}", p.id, p.title);
         println!("             {}", p.desc);
-        println!("             {} tweaks; for: {}", p.selections.len(), p.recommended_for);
+        println!(
+            "             {} tweaks; for: {}",
+            p.selections.len(),
+            p.recommended_for
+        );
         println!();
     }
 }
@@ -405,7 +429,9 @@ fn cmd_build(args: &Args) -> Result<(), String> {
         eprintln!("{}: {}", n.level, n.text);
     }
     if resolved.risk == catalog::Risk::Risky && !args.yes {
-        return Err("this selection includes risky options; re-run with --yes to accept them".into());
+        return Err(
+            "this selection includes risky options; re-run with --yes to accept them".into(),
+        );
     }
 
     let req = Request {
@@ -413,7 +439,10 @@ fn cmd_build(args: &Args) -> Result<(), String> {
         base,
         selections: sel,
         extra: String::new(),
-        jobs: args.jobs.unwrap_or_else(system::suggested_jobs).clamp(1, 256),
+        jobs: args
+            .jobs
+            .unwrap_or_else(system::suggested_jobs)
+            .clamp(1, 256),
         output: Output::parse(&args.output),
         llvm: args.clang,
         clean: args.clean,
@@ -451,11 +480,19 @@ fn cmd_build(args: &Args) -> Result<(), String> {
     let st = job.state.lock().map_err(|_| "job state poisoned")?;
     println!();
     for s in &st.stages {
-        println!("  {:<8} {:<38} {}", format!("{:?}", s.state).to_lowercase(), s.title, s.detail);
+        println!(
+            "  {:<8} {:<38} {}",
+            format!("{:?}", s.state).to_lowercase(),
+            s.title,
+            s.detail
+        );
     }
     if !st.unapplied.is_empty() {
         println!();
-        println!("{} requested option(s) did not stick - see the warnings above.", st.unapplied.len());
+        println!(
+            "{} requested option(s) did not stick - see the warnings above.",
+            st.unapplied.len()
+        );
     }
     if !st.artifacts.is_empty() {
         println!();

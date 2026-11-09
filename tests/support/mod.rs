@@ -129,7 +129,12 @@ pub fn fixture(version: &str) -> Fixture {
     fs::write(&make, FAKE_MAKE).unwrap();
     set_executable(&make);
 
-    Fixture { root, tree, workdir, make }
+    Fixture {
+        root,
+        tree,
+        workdir,
+        make,
+    }
 }
 
 fn set_executable(p: &Path) {
