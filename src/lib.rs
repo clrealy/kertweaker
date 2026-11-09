@@ -6,8 +6,10 @@
 //! `make` for kbuild, `tar` for tarballs, `gzip` for `/proc/config.gz`, and
 //! `curl`/`wget` for downloads.
 
+pub mod api;
 pub mod build;
 pub mod catalog;
+pub mod http;
 pub mod json;
 pub mod kconfig;
 pub mod sources;

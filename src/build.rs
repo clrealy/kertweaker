@@ -217,6 +217,10 @@ pub struct JobState {
     pub artifacts: Vec<(String, u64)>,
     pub next_steps: Vec<String>,
     pub unapplied: Vec<kconfig::Unapplied>,
+    /// Requested as modules, built in instead.
+    pub builtin_instead: Vec<String>,
+    /// Plain-language observations about the resolved config.
+    pub advice: Vec<String>,
     pub diff_count: usize,
     pub config_path: Option<PathBuf>,
     pub tree: Option<PathBuf>,
@@ -244,6 +248,8 @@ pub struct Job {
     pub request: Request,
     pub state: Mutex<JobState>,
     pub cancel: Arc<AtomicBool>,
+    /// Whether make runs with LLVM=1: requested, or forced by an LTO option.
+    pub llvm: AtomicBool,
     pub child: Mutex<Option<Child>>,
     pub log_path: PathBuf,
     /// Monotonically bumped on every change, so clients can poll cheaply.
@@ -328,6 +334,7 @@ impl Job {
             ("error", Json::opt_s(st.error.clone())),
             ("output", Json::s(self.request.output.as_str())),
             ("jobs", Json::u(self.request.jobs)),
+            ("llvm", Json::b(self.llvm.load(Ordering::Relaxed))),
             ("objects", Json::n(st.objects as f64)),
             (
                 "objects_expected",
@@ -380,7 +387,8 @@ impl Job {
                                     Json::s(if u.present {
                                         kconfig::format_line(&u.symbol, &u.actual)
                                     } else {
-                                        format!("{} does not exist in this kernel", u.symbol)
+                                        "unavailable: not in this kernel version, or a dependency is off"
+                                            .to_string()
                                     }),
                                 ),
                             ])
@@ -388,6 +396,8 @@ impl Job {
                         .collect(),
                 ),
             ),
+            ("builtin_instead", Json::strs(st.builtin_instead.clone())),
+            ("advice", Json::strs(st.advice.clone())),
             ("log_dropped", Json::u(st.dropped)),
             ("log_total", Json::u(st.dropped + st.log.len())),
         ];
@@ -459,6 +469,8 @@ pub fn new_job(id: String, req: Request) -> Arc<Job> {
             artifacts: Vec::new(),
             next_steps: Vec::new(),
             unapplied: Vec::new(),
+            builtin_instead: Vec::new(),
+            advice: Vec::new(),
             diff_count: 0,
             config_path: None,
             tree: None,
@@ -467,6 +479,7 @@ pub fn new_job(id: String, req: Request) -> Arc<Job> {
             phase: "starting".into(),
         }),
         cancel: Arc::new(AtomicBool::new(false)),
+        llvm: AtomicBool::new(req.llvm),
         child: Mutex::new(None),
         revision: AtomicU64::new(0),
         id,
@@ -590,9 +603,17 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
         job.finish("deps", StageState::Failed, missing.join(", "));
         return Err(format!("missing build tools: {}", missing.join(", ")));
     }
-    if req.llvm && crate::system::which("clang").is_none() {
+    let resolved = catalog::resolve_with_extra(&req.selections, &req.extra);
+    if resolved.needs_clang() && !req.llvm {
+        job.log("Link-time optimisation is clang-only, so this build uses LLVM=1.");
+        job.llvm.store(true, Ordering::Relaxed);
+    }
+    if job.llvm.load(Ordering::Relaxed) && crate::system::which("clang").is_none() {
         job.finish("deps", StageState::Failed, "clang not installed");
-        return Err("the clang toolchain was selected but clang is not installed".into());
+        return Err("this build needs clang (LLVM=1), but clang is not installed".into());
+    }
+    for note in resolved.missing_tool_notes(|tool| crate::system::which(tool).is_some()) {
+        job.log(&format!("warning: {}", note.text));
     }
     job.finish(
         "deps",
@@ -651,12 +672,15 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     bail_if_cancelled(job)?;
 
     // ------------------------------------------------------------ 4. trim
-    let resolved = catalog::resolve_with_extra(&req.selections, &req.extra);
     if resolved.localmodconfig {
         job.begin("trim");
+        // localmodconfig runs an interactive oldconfig for any symbol the base
+        // does not mention. Bring the config up to date for this tree first so
+        // there is nothing left to ask, and answer "default" to anything that
+        // slips through.
+        make(job, &tree, &["olddefconfig"], 1)?;
         job.log("Scanning loaded modules (make localmodconfig)...");
-        // localmodconfig asks questions about new symbols; feed it defaults.
-        make_with_stdin(job, &tree, &["localmodconfig"], 1, "")?;
+        make_with_stdin(job, &tree, &["localmodconfig"], 1, &"\n".repeat(4096))?;
         let after = Config::load(&dot_config).map_err(|e| e.to_string())?;
         job.finish(
             "trim",
@@ -671,7 +695,7 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     // ---------------------------------------------------------- 5. tweaks
     job.begin("tweaks");
     let mut cfg = Config::load(&dot_config).map_err(|e| e.to_string())?;
-    let changed = cfg.apply(&resolved.fragment);
+    let changed = cfg.merge(&resolved.fragment);
     cfg.save(&dot_config).map_err(|e| e.to_string())?;
     let fragment_path = req.workdir.join("configs").join(format!("{}.fragment", job.id));
     let _ = fs::create_dir_all(fragment_path.parent().unwrap());
@@ -717,7 +741,8 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
 
     // ---------------------------------------------------------- 7. verify
     job.begin("verify");
-    let unapplied = kconfig::verify(&resolved.fragment, &final_config);
+    let verification = kconfig::check(&resolved.fragment, &final_config, catalog::ALIASES);
+    let unapplied = verification.unapplied.clone();
     for u in &unapplied {
         job.log(&format!(
             "warning: wanted {}, got {}",
@@ -725,23 +750,28 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
             if u.present {
                 kconfig::format_line(&u.symbol, &u.actual)
             } else {
-                format!("{} not present in this kernel version", u.symbol)
+                format!(
+                    "{} unavailable (not in this kernel version, or a dependency is off)",
+                    u.symbol
+                )
             }
         ));
+    }
+    let advice = advise(&final_config, &verification);
+    for line in &advice {
+        job.log(&format!("note: {line}"));
     }
     {
         let mut st = job.state.lock().map_err(|_| "state poisoned")?;
         st.unapplied = unapplied.clone();
+        st.builtin_instead = verification.builtin_instead.clone();
+        st.advice = advice;
     }
     job.finish(
         "verify",
+        StageState::Done,
         if unapplied.is_empty() {
-            StageState::Done
-        } else {
-            StageState::Done
-        },
-        if unapplied.is_empty() {
-            "every requested option stuck".to_string()
+            "every requested option took effect".to_string()
         } else {
             format!(
                 "{} of {} requested options did not stick",
@@ -838,6 +868,37 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     Ok(())
 }
 
+/// Explain the resolved config in plain language where the raw lists would
+/// leave someone guessing at the cause.
+fn advise(config: &Config, v: &kconfig::Verification) -> Vec<String> {
+    let mut out = Vec::new();
+    let modules_off = !config.enabled("CONFIG_MODULES");
+    if !v.builtin_instead.is_empty() {
+        out.push(if modules_off {
+            format!(
+                "This config has loadable modules switched off (CONFIG_MODULES), so {} option(s) \
+                 you asked for as modules are built into the kernel image instead.",
+                v.builtin_instead.len()
+            )
+        } else {
+            format!(
+                "{} option(s) you asked for as modules are built in instead, because something \
+                 built in depends on them.",
+                v.builtin_instead.len()
+            )
+        });
+    }
+    if modules_off && !v.unapplied.is_empty() {
+        out.push(
+            "Loadable modules are off, and some options (kprobes, the BPF JIT, module signing \
+             and compression) depend on module support. Turn on 'Loadable module support' under \
+             Build size & speed if you want them."
+                .to_string(),
+        );
+    }
+    out
+}
+
 fn bail_if_cancelled(job: &Arc<Job>) -> Result<(), String> {
     if job.cancelled() {
         Err("cancelled".into())
@@ -873,7 +934,8 @@ fn make_with_stdin(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if req.llvm {
+    let llvm = job.llvm.load(Ordering::Relaxed);
+    if llvm {
         cmd.arg("LLVM=1");
     }
 
@@ -882,7 +944,7 @@ fn make_with_stdin(
         req.make,
         jobs.max(1),
         args.join(" "),
-        if req.llvm { " LLVM=1" } else { "" }
+        if llvm { " LLVM=1" } else { "" }
     ));
 
     let mut child = cmd

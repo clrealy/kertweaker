@@ -129,6 +129,33 @@ fn verify_reports_options_that_did_not_stick() {
 }
 
 #[test]
+fn modules_built_in_are_reported_as_advice_not_as_failures() {
+    let f = fixture("6.12.3");
+    let mut req = request(&f, selections(&[]));
+    // The stub's defconfig has CONFIG_MODULES=y; turn it off and ask for a
+    // module, then pretend kbuild promoted it the way real Kconfig does.
+    req.base = Base::Text("# CONFIG_MODULES is not set\nCONFIG_DRM=y\nCONFIG_XFS_FS=y\n".into());
+    req.extra = "CONFIG_XFS_FS=m\n".into();
+    std::fs::write(
+        &f.make,
+        std::fs::read_to_string(&f.make).unwrap().replace(
+            "  olddefconfig)",
+            "  olddefconfig)\n    sed -i 's/^CONFIG_XFS_FS=m/CONFIG_XFS_FS=y/' .config",
+        ),
+    )
+    .unwrap();
+    req.config_only = true;
+    let job = run(req);
+
+    let st = job.state.lock().unwrap();
+    assert_eq!(st.status, Status::Done, "{:?}", st.error);
+    assert!(st.unapplied.is_empty(), "{:?}", st.unapplied);
+    assert_eq!(st.builtin_instead, vec!["CONFIG_XFS_FS"]);
+    assert_eq!(st.advice.len(), 1);
+    assert!(st.advice[0].contains("loadable modules switched off"), "{}", st.advice[0]);
+}
+
+#[test]
 fn localmodconfig_runs_when_the_profile_asks_for_it() {
     let f = fixture("6.12.3");
     let job = run(request(&f, selections(&[("localmodconfig_hint", "on")])));

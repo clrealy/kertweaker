@@ -162,6 +162,50 @@ impl Config {
         changed
     }
 
+    /// Apply a fragment the way the kernel's own `merge_config.sh` does: drop
+    /// each symbol's old line and append the new value at the end of the file.
+    ///
+    /// Position matters. For a Kconfig `choice`, the *last* member set to `y`
+    /// wins, so editing a line in place can silently lose to a different member
+    /// that happens to sit further down (x86_64_defconfig's
+    /// `CPU_FREQ_DEFAULT_GOV_USERSPACE=y` is a real example). Appending makes
+    /// the request win, exactly as it would with the upstream tool.
+    ///
+    /// Returns the symbols whose effective state changed.
+    pub fn merge(&mut self, fragment: &[(String, Value)]) -> Vec<String> {
+        let differing: Vec<&(String, Value)> = fragment
+            .iter()
+            .filter(|(sym, val)| self.values.get(sym) != Some(val))
+            .collect();
+        if differing.is_empty() {
+            return Vec::new();
+        }
+        // Turning off a symbol the base never mentioned is not a real change.
+        let changed: Vec<String> = differing
+            .iter()
+            .filter(|(sym, val)| val.is_some() || self.get(sym).is_some())
+            .map(|(sym, _)| sym.clone())
+            .collect();
+
+        let mut lines: Vec<String> = Vec::with_capacity(self.lines.len() + differing.len() + 3);
+        for line in self.lines.drain(..) {
+            let replaced = parse_line(&line)
+                .map(|(sym, _)| differing.iter().any(|(s, _)| s == sym))
+                .unwrap_or(false);
+            if !replaced {
+                lines.push(line);
+            }
+        }
+        lines.push("#".to_string());
+        lines.push("# Set by kertweaker".to_string());
+        lines.push("#".to_string());
+        for (sym, val) in differing {
+            lines.push(format_line(sym, val));
+        }
+        *self = Config::parse(&lines.join("\n"));
+        changed
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(self.lines.iter().map(|l| l.len() + 1).sum());
         for line in &self.lines {
@@ -315,31 +359,67 @@ pub struct Unapplied {
 }
 
 pub fn verify(wanted: &[(String, Value)], result: &Config) -> Vec<Unapplied> {
-    let mut out = Vec::new();
-    for (sym, want) in wanted {
+    check(wanted, result, &[]).unapplied
+}
+
+/// The outcome of comparing what was asked for with what kbuild produced.
+#[derive(Debug, Clone, Default)]
+pub struct Verification {
+    /// Requests that did not take effect.
+    pub unapplied: Vec<Unapplied>,
+    /// Asked for as a module (`=m`), built into the image (`=y`) instead.
+    /// The feature is there, so this is information rather than a failure.
+    pub builtin_instead: Vec<String>,
+}
+
+/// Compare a requested fragment against the config kbuild settled on.
+///
+/// `aliases` lists symbols that were renamed between kernel versions. A catalog
+/// option requests every spelling; if one of them took effect, the others
+/// being absent is expected and not worth a warning.
+pub fn check(wanted: &[(String, Value)], result: &Config, aliases: &[&[&str]]) -> Verification {
+    let satisfied = |sym: &str, want: &Value| -> bool {
         match result.raw(sym) {
-            Some(actual) if actual == want => {}
-            Some(actual) => out.push(Unapplied {
-                symbol: sym.clone(),
-                wanted: want.clone(),
-                actual: actual.clone(),
-                present: true,
-            }),
-            None => {
-                // An absent symbol satisfies a request to turn it off.
-                if want.is_some() {
-                    out.push(Unapplied {
-                        symbol: sym.clone(),
-                        wanted: want.clone(),
-                        actual: None,
-                        present: false,
-                    });
-                }
-            }
+            Some(actual) => actual == want,
+            // An absent symbol satisfies a request to turn it off.
+            None => want.is_none(),
         }
+    };
+    let mut out = Verification::default();
+    for (sym, want) in wanted {
+        if satisfied(sym, want) {
+            continue;
+        }
+        // m -> y happens when the config has no loadable-module support, or
+        // when something built in selects the symbol. Either way it is present.
+        if want.as_deref() == Some("m") && result.get(sym) == Some("y") {
+            out.builtin_instead.push(sym.clone());
+            continue;
+        }
+        let covered_by_alias = aliases
+            .iter()
+            .filter(|group| group.contains(&sym.as_str()))
+            .flat_map(|group| group.iter())
+            .filter(|other| **other != sym.as_str())
+            .any(|other| {
+                wanted
+                    .iter()
+                    .any(|(s, v)| s == other && v == want && satisfied(s, v))
+            });
+        if covered_by_alias {
+            continue;
+        }
+        let actual = result.raw(sym);
+        out.unapplied.push(Unapplied {
+            symbol: sym.clone(),
+            wanted: want.clone(),
+            actual: actual.cloned().flatten(),
+            present: actual.is_some(),
+        });
     }
-    // Sorted, so the warning list is stable however the fragment was ordered.
-    out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    // Sorted, so the lists are stable however the fragment was ordered.
+    out.unapplied.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    out.builtin_instead.sort();
     out
 }
 
@@ -457,6 +537,76 @@ mod tests {
                 ("CONFIG_D".to_string(), None),
             ]
         );
+    }
+
+    #[test]
+    fn merge_appends_so_a_choice_request_wins() {
+        // USERSPACE=y sits *below* PERFORMANCE in the base, as in x86_64_defconfig.
+        let mut c = Config::parse(
+            "# CONFIG_GOV_PERFORMANCE is not set\nCONFIG_OTHER=y\nCONFIG_GOV_USERSPACE=y\n",
+        );
+        let changed = c.merge(&[
+            ("CONFIG_GOV_PERFORMANCE".into(), Some("y".into())),
+            ("CONFIG_OTHER".into(), Some("y".into())), // already set: untouched
+            ("CONFIG_NEVER_SEEN".into(), None),        // off and absent: no real change
+        ]);
+        assert_eq!(changed, vec!["CONFIG_GOV_PERFORMANCE"]);
+        let text = c.render();
+        let perf = text.find("CONFIG_GOV_PERFORMANCE=y").unwrap();
+        let user = text.find("CONFIG_GOV_USERSPACE=y").unwrap();
+        assert!(perf > user, "the request must come last so kconfig prefers it:\n{text}");
+        assert!(!text.contains("# CONFIG_GOV_PERFORMANCE is not set"));
+        assert_eq!(text.matches("CONFIG_OTHER=y").count(), 1);
+        // Index is rebuilt, so later edits still work.
+        assert_eq!(c.get("CONFIG_GOV_PERFORMANCE"), Some("y"));
+        assert!(c.set("CONFIG_GOV_PERFORMANCE", None));
+        assert!(c.render().contains("# CONFIG_GOV_PERFORMANCE is not set"));
+    }
+
+    #[test]
+    fn merge_with_nothing_to_do_leaves_the_file_alone() {
+        let mut c = Config::parse(SAMPLE);
+        assert!(c.merge(&[("CONFIG_A".into(), Some("y".into()))]).is_empty());
+        assert_eq!(c.render(), SAMPLE);
+    }
+
+    #[test]
+    fn renamed_symbols_do_not_raise_false_alarms() {
+        let aliases: &[&[&str]] = &[&["CONFIG_NEW_NAME", "CONFIG_OLD_NAME"]];
+        let wanted = vec![
+            ("CONFIG_NEW_NAME".to_string(), Some("y".to_string())),
+            ("CONFIG_OLD_NAME".to_string(), Some("y".to_string())),
+        ];
+        // This kernel only knows the new spelling, and it took effect.
+        let newer = Config::parse("CONFIG_NEW_NAME=y\n");
+        assert!(check(&wanted, &newer, aliases).unapplied.is_empty());
+        // An older kernel only knows the old spelling.
+        let older = Config::parse("CONFIG_OLD_NAME=y\n");
+        assert!(check(&wanted, &older, aliases).unapplied.is_empty());
+        // Neither took effect: that is a real problem and both are reported.
+        let neither = Config::parse("# CONFIG_NEW_NAME is not set\n");
+        assert_eq!(check(&wanted, &neither, aliases).unapplied.len(), 2);
+        // Without alias knowledge the absent spelling is flagged.
+        assert_eq!(verify(&wanted, &newer).len(), 1);
+    }
+
+    #[test]
+    fn a_module_built_in_instead_is_information_not_failure() {
+        let wanted = vec![
+            ("CONFIG_BTRFS_FS".to_string(), Some("m".to_string())),
+            ("CONFIG_XFS_FS".to_string(), Some("m".to_string())),
+            ("CONFIG_KPROBES".to_string(), Some("y".to_string())),
+            ("CONFIG_WANT_BUILTIN".to_string(), Some("y".to_string())),
+        ];
+        // A monolithic config: no module support, so m became y; kprobes needs
+        // modules and is gone; and y -> m is a genuine downgrade.
+        let result = Config::parse(
+            "# CONFIG_MODULES is not set\nCONFIG_BTRFS_FS=y\nCONFIG_XFS_FS=y\nCONFIG_WANT_BUILTIN=m\n",
+        );
+        let v = check(&wanted, &result, &[]);
+        assert_eq!(v.builtin_instead, vec!["CONFIG_BTRFS_FS", "CONFIG_XFS_FS"]);
+        let failed: Vec<&str> = v.unapplied.iter().map(|u| u.symbol.as_str()).collect();
+        assert_eq!(failed, vec!["CONFIG_KPROBES", "CONFIG_WANT_BUILTIN"]);
     }
 
     #[test]

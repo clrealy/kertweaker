@@ -71,9 +71,15 @@ pub struct Opt {
     pub sets: Vec<(&'static str, Option<&'static str>)>,
     pub risk: Risk,
     pub note: &'static str,
+    /// Host tools this option needs; kbuild silently drops it without them.
+    pub needs: Vec<&'static str>,
 }
 
 impl Opt {
+    pub fn needs(mut self, tools: &[&'static str]) -> Self {
+        self.needs = tools.to_vec();
+        self
+    }
     pub fn risk(mut self, risk: Risk) -> Self {
         self.risk = risk;
         self
@@ -89,6 +95,7 @@ impl Opt {
             ("description", Json::s(self.desc)),
             ("risk", Json::s(self.risk.as_str())),
             ("note", Json::s(self.note)),
+            ("needs", Json::strs(self.needs.clone())),
             (
                 "sets",
                 Json::Obj(
@@ -124,6 +131,7 @@ pub fn opt(
         sets: sets.to_vec(),
         risk: Risk::Safe,
         note: "",
+        needs: Vec::new(),
     }
 }
 
@@ -324,20 +332,25 @@ fn build_catalog() -> Vec<Tweak> {
                 "Driven by scheduler utilisation. Best all-rounder on recent kernels.",
                 &[("CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL", Y), ("CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE", OFF),
                   ("CONFIG_CPU_FREQ_DEFAULT_GOV_POWERSAVE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND", OFF),
-                  ("CONFIG_CPU_FREQ_GOV_SCHEDUTIL", Y)]))
+                  ("CONFIG_CPU_FREQ_GOV_SCHEDUTIL", Y),
+                  ("CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE", OFF)]))
             .opt(opt("performance", "performance",
                 "Pin clocks high. Lowest latency, highest power draw and heat.",
                 &[("CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE", Y), ("CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL", OFF),
                   ("CONFIG_CPU_FREQ_DEFAULT_GOV_POWERSAVE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND", OFF),
-                  ("CONFIG_CPU_FREQ_GOV_PERFORMANCE", Y)]))
+                  ("CONFIG_CPU_FREQ_GOV_PERFORMANCE", Y),
+                  ("CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE", OFF)]))
             .opt(opt("ondemand", "ondemand", "The older ramp-up-on-load governor.",
                 &[("CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND", Y), ("CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL", OFF),
                   ("CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_POWERSAVE", OFF),
-                  ("CONFIG_CPU_FREQ_GOV_ONDEMAND", Y)]))
+                  ("CONFIG_CPU_FREQ_GOV_ONDEMAND", Y),
+                  ("CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE", OFF)])
+                .note("Cannot be the default on a kernel built with the Intel P-state driver (X86_INTEL_PSTATE); kbuild falls back to schedutil there."))
             .opt(opt("powersave", "powersave", "Stay low. Long battery life, sluggish under load.",
                 &[("CONFIG_CPU_FREQ_DEFAULT_GOV_POWERSAVE", Y), ("CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL", OFF),
                   ("CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND", OFF),
-                  ("CONFIG_CPU_FREQ_GOV_POWERSAVE", Y)])),
+                  ("CONFIG_CPU_FREQ_GOV_POWERSAVE", Y),
+                  ("CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE", OFF), ("CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE", OFF)])),
 
         Tweak::new("x86_cpu_family", "cpu", "Processor family (x86-64)",
             "Lets the compiler assume your CPU's instruction set. 'Generic' runs anywhere; the specific ones only boot on matching hardware.")
@@ -403,8 +416,7 @@ fn build_catalog() -> Vec<Tweak> {
             "A compressed RAM disk, usually used as swap by modern distros.")
             .toggle()
             .opt(opt("on", "Enable (module)", "What zram-generator expects.",
-                &[("CONFIG_ZRAM", M), ("CONFIG_ZSMALLOC", Y), ("CONFIG_ZRAM_DEF_COMP_ZSTD", Y),
-                  ("CONFIG_CRYPTO_ZSTD", Y)]))
+                &[("CONFIG_ZRAM", M), ("CONFIG_ZRAM_DEF_COMP_ZSTD", Y), ("CONFIG_CRYPTO_ZSTD", Y)]))
             .opt(opt("off", "Disable", "", &[("CONFIG_ZRAM", OFF)])),
 
         Tweak::new("ksm", "memory", "Kernel same-page merging",
@@ -463,7 +475,7 @@ fn build_catalog() -> Vec<Tweak> {
             .toggle()
             .opt(opt("on", "Build fq_codel + CAKE + fq", "Recommended for any machine that routes or uploads.",
                 &[("CONFIG_NET_SCH_FQ_CODEL", Y), ("CONFIG_NET_SCH_CAKE", M), ("CONFIG_NET_SCH_FQ", Y),
-                  ("CONFIG_DEFAULT_FQ_CODEL", Y)]))
+                  ("CONFIG_NET_SCH_DEFAULT", Y), ("CONFIG_DEFAULT_FQ_CODEL", Y)]))
             .opt(opt("off", "Skip them", "", &[("CONFIG_NET_SCH_CAKE", OFF)])),
 
         Tweak::new("wireguard", "network", "WireGuard VPN",
@@ -484,18 +496,30 @@ fn build_catalog() -> Vec<Tweak> {
             .opt(opt("amd", "AMD only (amdgpu)", "",
                 &[("CONFIG_DRM", Y), ("CONFIG_DRM_AMDGPU", M), ("CONFIG_DRM_AMD_DC", Y),
                   ("CONFIG_DRM_I915", OFF), ("CONFIG_DRM_NOUVEAU", OFF), ("CONFIG_DRM_SIMPLEDRM", Y),
+                  ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
                   ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
             .opt(opt("intel", "Intel only (i915 + xe)", "",
                 &[("CONFIG_DRM", Y), ("CONFIG_DRM_I915", M), ("CONFIG_DRM_XE", M),
                   ("CONFIG_DRM_AMDGPU", OFF), ("CONFIG_DRM_NOUVEAU", OFF), ("CONFIG_DRM_SIMPLEDRM", Y),
+                  ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
                   ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
             .opt(opt("nvidia_nouveau", "NVIDIA open driver (nouveau)",
                 "The in-tree driver. The proprietary NVIDIA module is built separately through DKMS.",
                 &[("CONFIG_DRM", Y), ("CONFIG_DRM_NOUVEAU", M), ("CONFIG_DRM_AMDGPU", OFF),
-                  ("CONFIG_DRM_I915", OFF), ("CONFIG_DRM_SIMPLEDRM", Y), ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
+                  ("CONFIG_DRM_I915", OFF), ("CONFIG_DRM_SIMPLEDRM", Y), ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
+                  ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
             .opt(opt("all", "All of them", "Slowest to build, works on any machine.",
                 &[("CONFIG_DRM", Y), ("CONFIG_DRM_AMDGPU", M), ("CONFIG_DRM_I915", M),
-                  ("CONFIG_DRM_NOUVEAU", M), ("CONFIG_DRM_SIMPLEDRM", Y), ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
+                  ("CONFIG_DRM_NOUVEAU", M), ("CONFIG_DRM_SIMPLEDRM", Y), ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
+                  ("CONFIG_FRAMEBUFFER_CONSOLE", Y)]))
+            .opt(opt("virtual", "Virtual machine display (virtio-gpu, QXL, bochs, VMware)",
+                "For a VM guest with a graphical console.",
+                &[("CONFIG_DRM", Y), ("CONFIG_DRM_VIRTIO_GPU", M), ("CONFIG_DRM_QXL", M),
+                  ("CONFIG_DRM_BOCHS", M), ("CONFIG_DRM_VMWGFX", M), ("CONFIG_DRM_AMDGPU", OFF),
+                  ("CONFIG_DRM_I915", OFF), ("CONFIG_DRM_NOUVEAU", OFF), ("CONFIG_DRM_SIMPLEDRM", Y),
+                  ("CONFIG_FB", Y), ("CONFIG_DRM_FBDEV_EMULATION", Y),
+                  ("CONFIG_FRAMEBUFFER_CONSOLE", Y)])
+                .note("virtio-gpu also needs 'Run as a VM guest' switched on."))
             .opt(opt("headless", "None (headless server)",
                 "No DRM at all. Do not pick this for a machine with a screen.",
                 &[("CONFIG_DRM", OFF), ("CONFIG_DRM_AMDGPU", OFF), ("CONFIG_DRM_I915", OFF),
@@ -508,7 +532,8 @@ fn build_catalog() -> Vec<Tweak> {
             .toggle()
             .opt(opt("on", "Enable ALSA + HDA + USB audio", "",
                 &[("CONFIG_SOUND", Y), ("CONFIG_SND", M), ("CONFIG_SND_HDA_INTEL", M),
-                  ("CONFIG_SND_USB_AUDIO", M), ("CONFIG_SND_HDA_CODEC_HDMI", M)]))
+                  ("CONFIG_SND_HDA_CODEC_HDMI", M), ("CONFIG_USB_SUPPORT", Y), ("CONFIG_USB", Y),
+                  ("CONFIG_SND_USB", Y), ("CONFIG_SND_USB_AUDIO", M)]))
             .opt(opt("off", "No sound", "Server builds only.", &[("CONFIG_SOUND", OFF)]).risk(Risk::Caution)),
 
         // -------------------------------------------------------------- virt
@@ -524,20 +549,25 @@ fn build_catalog() -> Vec<Tweak> {
                 &[("CONFIG_KVM", OFF), ("CONFIG_KVM_INTEL", OFF), ("CONFIG_KVM_AMD", OFF)])),
 
         Tweak::new("virtio_guest", "virt", "Run as a VM guest",
-            "virtio drivers, so this kernel boots well inside QEMU/KVM, Proxmox and cloud instances.")
+            "virtio disk, network and console drivers, so this kernel boots well inside QEMU/KVM, Proxmox and cloud instances. The virtual display lives under GPU drivers.")
             .toggle()
             .opt(opt("on", "Enable virtio guest drivers", "",
-                &[("CONFIG_HYPERVISOR_GUEST", Y), ("CONFIG_PARAVIRT", Y), ("CONFIG_VIRTIO", Y),
+                &[("CONFIG_HYPERVISOR_GUEST", Y), ("CONFIG_PARAVIRT", Y), ("CONFIG_VIRTIO_MENU", Y),
                   ("CONFIG_VIRTIO_PCI", Y), ("CONFIG_VIRTIO_BLK", Y), ("CONFIG_VIRTIO_NET", Y),
-                  ("CONFIG_VIRTIO_CONSOLE", Y), ("CONFIG_VIRTIO_BALLOON", Y), ("CONFIG_SCSI_VIRTIO", Y),
-                  ("CONFIG_DRM_VIRTIO_GPU", M), ("CONFIG_VIRTIO_MMIO", Y)]))
-            .opt(opt("off", "Bare metal only", "", &[("CONFIG_VIRTIO", OFF)]).risk(Risk::Caution)),
+                  ("CONFIG_VIRTIO_CONSOLE", Y), ("CONFIG_VIRTIO_BALLOON", Y), ("CONFIG_VIRTIO_MMIO", Y),
+                  ("CONFIG_SCSI", Y), ("CONFIG_BLK_DEV_SD", Y), ("CONFIG_SCSI_VIRTIO", Y)]))
+            .opt(opt("off", "Bare metal only", "Drops the virtio drivers. This kernel will not boot as a VM guest.",
+                &[("CONFIG_VIRTIO_MENU", OFF), ("CONFIG_VIRTIO_PCI", OFF), ("CONFIG_VIRTIO_MMIO", OFF),
+                  ("CONFIG_VIRTIO_BLK", OFF), ("CONFIG_VIRTIO_NET", OFF), ("CONFIG_VIRTIO_CONSOLE", OFF),
+                  ("CONFIG_VIRTIO_BALLOON", OFF), ("CONFIG_SCSI_VIRTIO", OFF)])
+                .risk(Risk::Caution)),
 
         Tweak::new("containers", "virt", "Container support",
             "Everything Docker, Podman and Kubernetes check for: namespaces, cgroup v2, overlayfs, veth and the netfilter bits.")
             .toggle()
             .opt(opt("on", "Enable container support", "",
                 &[("CONFIG_NAMESPACES", Y), ("CONFIG_USER_NS", Y), ("CONFIG_PID_NS", Y), ("CONFIG_NET_NS", Y),
+                  ("CONFIG_NETFILTER", Y), ("CONFIG_NETFILTER_ADVANCED", Y),
                   ("CONFIG_CGROUPS", Y), ("CONFIG_MEMCG", Y), ("CONFIG_CGROUP_PIDS", Y), ("CONFIG_CPUSETS", Y),
                   ("CONFIG_CGROUP_SCHED", Y), ("CONFIG_BLK_CGROUP", Y), ("CONFIG_OVERLAY_FS", M),
                   ("CONFIG_VETH", M), ("CONFIG_BRIDGE", M), ("CONFIG_BRIDGE_NETFILTER", M),
@@ -571,10 +601,11 @@ fn build_catalog() -> Vec<Tweak> {
                   ("CONFIG_STRICT_KERNEL_RWX", Y), ("CONFIG_STRICT_MODULE_RWX", Y),
                   ("CONFIG_HARDENED_USERCOPY", Y), ("CONFIG_SLAB_FREELIST_RANDOM", Y),
                   ("CONFIG_SLAB_FREELIST_HARDENED", Y), ("CONFIG_VMAP_STACK", Y),
-                  ("CONFIG_INIT_ON_ALLOC_DEFAULT_ON", Y), ("CONFIG_GCC_PLUGIN_STACKLEAK", Y),
+                  ("CONFIG_INIT_ON_ALLOC_DEFAULT_ON", Y), ("CONFIG_GCC_PLUGIN_STACKLEAK", Y), ("CONFIG_KSTACK_ERASE", Y),
                   ("CONFIG_LEGACY_VSYSCALL_NONE", Y), ("CONFIG_SCHED_STACK_END_CHECK", Y),
                   ("CONFIG_BUG_ON_DATA_CORRUPTION", Y)])
-                .risk(Risk::Caution))
+                .risk(Risk::Caution)
+                .note("Stack-leak clearing is a GCC plugin on kernels before 6.17: without the gcc plugin headers (gcc-plugin-dev) kbuild drops that one option."))
             .opt(opt("paranoid", "Paranoid",
                 "Also zeroes on free, randomises struct layout and locks the kernel down. Real performance cost.",
                 &[("CONFIG_STACKPROTECTOR_STRONG", Y), ("CONFIG_FORTIFY_SOURCE", Y),
@@ -583,17 +614,19 @@ fn build_catalog() -> Vec<Tweak> {
                   ("CONFIG_HARDENED_USERCOPY", Y), ("CONFIG_SLAB_FREELIST_RANDOM", Y),
                   ("CONFIG_SLAB_FREELIST_HARDENED", Y), ("CONFIG_VMAP_STACK", Y),
                   ("CONFIG_INIT_ON_ALLOC_DEFAULT_ON", Y), ("CONFIG_INIT_ON_FREE_DEFAULT_ON", Y),
-                  ("CONFIG_GCC_PLUGIN_STACKLEAK", Y), ("CONFIG_RANDSTRUCT_FULL", Y),
+                  ("CONFIG_GCC_PLUGIN_STACKLEAK", Y), ("CONFIG_KSTACK_ERASE", Y), ("CONFIG_RANDSTRUCT_FULL", Y),
                   ("CONFIG_ZERO_CALL_USED_REGS", Y), ("CONFIG_SECURITY_LOCKDOWN_LSM", Y),
                   ("CONFIG_SECURITY_LOCKDOWN_LSM_EARLY", Y), ("CONFIG_LEGACY_VSYSCALL_NONE", Y),
-                  ("CONFIG_BUG_ON_DATA_CORRUPTION", Y), ("CONFIG_IO_STRICT_DEVMEM", Y)])
+                  ("CONFIG_BUG_ON_DATA_CORRUPTION", Y)])
                 .risk(Risk::Caution)
-                .note("Lockdown in integrity mode blocks unsigned module loading, which breaks DKMS modules such as the proprietary NVIDIA driver.")),
+                .note("Lockdown blocks unsigned module loading, which breaks DKMS modules such as the proprietary NVIDIA driver. Stack-leak clearing and struct randomisation need the gcc plugin headers (gcc-plugin-dev) on kernels before 6.17, and struct randomisation cannot be combined with BTF debug info.")),
 
-        Tweak::new("attack_surface", "security", "Trim attack surface",
-            "Removes legacy interfaces that are mostly useful to attackers.")
-            .toggle()
-            .opt(opt("on", "Remove /dev/mem and /proc/kcore, restrict dmesg", "",
+        Tweak::new("attack_surface", "security", "Legacy kernel interfaces",
+            "/dev/mem, /proc/kcore and friends are mostly useful to attackers. Restrict them, or remove them outright.")
+            .opt(opt("restrict", "Restrict", "Keeps /dev/mem but limits it to non-RAM, non-claimed regions, and hides dmesg from unprivileged users.",
+                &[("CONFIG_STRICT_DEVMEM", Y), ("CONFIG_IO_STRICT_DEVMEM", Y),
+                  ("CONFIG_SECURITY_DMESG_RESTRICT", Y)]))
+            .opt(opt("on", "Remove", "No /dev/mem, /dev/port or /proc/kcore at all, restricted dmesg, no legacy PTYs or binfmt_misc.",
                 &[("CONFIG_DEVMEM", OFF), ("CONFIG_DEVPORT", OFF), ("CONFIG_PROC_KCORE", OFF),
                   ("CONFIG_SECURITY_DMESG_RESTRICT", Y), ("CONFIG_LEGACY_PTYS", OFF),
                   ("CONFIG_BINFMT_MISC", OFF)])
@@ -632,7 +665,7 @@ fn build_catalog() -> Vec<Tweak> {
             .risk(Risk::Risky)
             .opt(opt("on", "Keep mitigations compiled in", "",
                 &[("CONFIG_CPU_MITIGATIONS", Y), ("CONFIG_SPECULATION_MITIGATIONS", Y),
-                  ("CONFIG_MITIGATION_RETPOLINE", Y)]))
+                  ("CONFIG_MITIGATION_RETPOLINE", Y), ("CONFIG_RETPOLINE", Y)]))
             .opt(opt("off", "Compile them out",
                 "Like booting with mitigations=off, but unchangeable at runtime.",
                 &[("CONFIG_CPU_MITIGATIONS", OFF), ("CONFIG_SPECULATION_MITIGATIONS", OFF)])
@@ -652,10 +685,13 @@ fn build_catalog() -> Vec<Tweak> {
             .opt(opt("btf", "BTF only (keeps eBPF tooling working)",
                 "What modern distros ship. Needs pahole installed.",
                 &[("CONFIG_DEBUG_INFO_NONE", OFF), ("CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT", Y),
-                  ("CONFIG_DEBUG_INFO_BTF", Y), ("CONFIG_DEBUG_INFO_REDUCED", OFF)]))
+                  ("CONFIG_BPF_SYSCALL", Y), ("CONFIG_DEBUG_INFO_BTF", Y), ("CONFIG_DEBUG_INFO_REDUCED", OFF)])
+                .needs(&["pahole"]))
             .opt(opt("full", "Full DWARF + BTF", "Everything. Slowest build, biggest artifacts.",
                 &[("CONFIG_DEBUG_INFO_NONE", OFF), ("CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT", Y),
-                  ("CONFIG_DEBUG_INFO_BTF", Y), ("CONFIG_DEBUG_INFO_REDUCED", OFF), ("CONFIG_GDB_SCRIPTS", Y)])),
+                  ("CONFIG_BPF_SYSCALL", Y), ("CONFIG_DEBUG_INFO_BTF", Y), ("CONFIG_DEBUG_INFO_REDUCED", OFF),
+                  ("CONFIG_GDB_SCRIPTS", Y)])
+                .needs(&["pahole"])),
 
         Tweak::new("localmodconfig_hint", "size", "Only build modules you are using",
             "Scans your loaded modules and switches off everything else. Cuts a distro config of ~8000 modules down to a few hundred.")
@@ -682,17 +718,31 @@ fn build_catalog() -> Vec<Tweak> {
             .opt(opt("thin", "ThinLTO (clang)", "Most of the benefit, far less RAM than full LTO.",
                 &[("CONFIG_LTO_CLANG_THIN", Y), ("CONFIG_LTO_NONE", OFF)])
                 .risk(Risk::Caution)
-                .note("Requires building with LLVM=1 (clang + lld): pick the clang toolchain in Build options."))
+                .needs(&["clang", "ld.lld"])
+                .note("Only clang can do this, so the whole kernel is built with LLVM=1 (clang + lld)."))
             .opt(opt("full", "Full LTO (clang)", "Needs a lot of RAM to link.",
                 &[("CONFIG_LTO_CLANG_FULL", Y), ("CONFIG_LTO_NONE", OFF)])
                 .risk(Risk::Risky)
-                .note("Can need 16 GiB or more to link, and is slow. Requires LLVM=1.")),
+                .needs(&["clang", "ld.lld"])
+                .note("Can need 16 GiB or more to link, and is slow. The whole kernel is built with LLVM=1.")),
+
+        Tweak::new("modules", "size", "Loadable module support",
+            "Whether drivers can be loaded on demand. Almost every desktop and server wants this on; tiny VMs and appliances sometimes build everything in.")
+            .toggle()
+            .opt(opt("on", "Enable", "Drivers load when needed, and DKMS modules can be built.",
+                &[("CONFIG_MODULES", Y), ("CONFIG_MODULE_UNLOAD", Y)]))
+            .opt(opt("off", "Disable (monolithic kernel)",
+                "Everything you enable is built into the image. Smaller attack surface, bigger kernel.",
+                &[("CONFIG_MODULES", OFF)])
+                .risk(Risk::Caution)
+                .note("No DKMS, no out-of-tree drivers, and anything this tool would build as a module is built in instead.")),
 
         Tweak::new("module_compress", "size", "Module compression",
             "Compress modules on install. zstd is the modern pick: small and fast to load.")
             .opt(opt("zstd", "zstd", "",
                 &[("CONFIG_MODULE_COMPRESS_ZSTD", Y), ("CONFIG_MODULE_COMPRESS_NONE", OFF),
-                  ("CONFIG_MODULE_COMPRESS_XZ", OFF), ("CONFIG_MODULE_COMPRESS_GZIP", OFF)]))
+                  ("CONFIG_MODULE_COMPRESS_XZ", OFF), ("CONFIG_MODULE_COMPRESS_GZIP", OFF)])
+                .needs(&["zstd"]))
             .opt(opt("xz", "xz", "Smallest, slowest to load.",
                 &[("CONFIG_MODULE_COMPRESS_XZ", Y), ("CONFIG_MODULE_COMPRESS_NONE", OFF),
                   ("CONFIG_MODULE_COMPRESS_ZSTD", OFF)]))
@@ -704,10 +754,12 @@ fn build_catalog() -> Vec<Tweak> {
             "Trade a little boot time against image size.")
             .opt(opt("zstd", "zstd", "Good ratio, fast to decompress.",
                 &[("CONFIG_KERNEL_ZSTD", Y), ("CONFIG_KERNEL_GZIP", OFF), ("CONFIG_KERNEL_XZ", OFF),
-                  ("CONFIG_KERNEL_LZ4", OFF)]))
+                  ("CONFIG_KERNEL_LZ4", OFF)])
+                .needs(&["zstd"]))
             .opt(opt("lz4", "lz4", "Fastest boot, biggest image.",
                 &[("CONFIG_KERNEL_LZ4", Y), ("CONFIG_KERNEL_ZSTD", OFF), ("CONFIG_KERNEL_GZIP", OFF),
-                  ("CONFIG_KERNEL_XZ", OFF)]))
+                  ("CONFIG_KERNEL_XZ", OFF)])
+                .needs(&["lz4"]))
             .opt(opt("gzip", "gzip", "The safe old default.",
                 &[("CONFIG_KERNEL_GZIP", Y), ("CONFIG_KERNEL_ZSTD", OFF), ("CONFIG_KERNEL_XZ", OFF),
                   ("CONFIG_KERNEL_LZ4", OFF)])),
@@ -715,7 +767,7 @@ fn build_catalog() -> Vec<Tweak> {
         Tweak::new("trim_ksyms", "size", "Trim unused exported symbols",
             "Drops exported symbols nothing in-tree uses. A smaller kernel, but out-of-tree modules may fail to build against it.")
             .toggle()
-            .opt(opt("on", "Trim them", "", &[("CONFIG_TRIM_UNUSED_KSYMS", Y)])
+            .opt(opt("on", "Trim them", "", &[("CONFIG_EXPERT", Y), ("CONFIG_TRIM_UNUSED_KSYMS", Y)])
                 .risk(Risk::Caution)
                 .note("Breaks DKMS modules such as the NVIDIA or VirtualBox drivers."))
             .opt(opt("off", "Keep all symbols", "", &[("CONFIG_TRIM_UNUSED_KSYMS", OFF)])),
@@ -828,12 +880,12 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         id: "vm_guest",
         title: "Virtual machine guest",
-        desc: "virtio everything, no physical GPU or sound drivers. Boots fast and builds fast.",
+        desc: "virtio disk, network and display; no physical GPU or sound drivers. Boots fast and builds fast.",
         recommended_for: "QEMU/KVM, Proxmox and cloud instances",
         selections: &[
             ("preempt", "voluntary"), ("hz", "250"), ("tickless", "idle"), ("cpufreq_gov", "schedutil"),
             ("thp", "madvise"), ("mglru", "on"), ("io_sched", "server"), ("filesystems", "common"),
-            ("tcp_cc", "bbr"), ("gpu", "headless"), ("sound", "off"), ("virtio_guest", "on"),
+            ("tcp_cc", "bbr"), ("gpu", "virtual"), ("sound", "off"), ("virtio_guest", "on"),
             ("kvm", "off"), ("containers", "on"), ("hardening", "standard"), ("debug_info", "none"),
             ("module_compress", "zstd"), ("kernel_compress", "zstd"), ("localmodconfig_hint", "on"),
             ("auto_localversion", "off"),
@@ -860,7 +912,7 @@ pub const PROFILES: &[Profile] = &[
             ("thp", "madvise"), ("mglru", "on"), ("io_sched", "desktop"), ("filesystems", "common"),
             ("tcp_cc", "bbr"), ("containers", "on"), ("hardening", "paranoid"),
             ("attack_surface", "on"), ("module_sig", "on"), ("mitigations", "on"),
-            ("debug_info", "btf"), ("module_compress", "zstd"), ("auto_localversion", "off"),
+            ("debug_info", "none"), ("module_compress", "zstd"), ("auto_localversion", "off"),
         ],
     },
 ];
@@ -873,6 +925,24 @@ pub fn profile(id: &str) -> Option<&'static Profile> {
 
 /// Pseudo-tweak id used when the user's own pasted fragment wins.
 pub const EXTRA: &str = "extra_options";
+
+/// Symbols that were renamed between kernel versions. Options request every
+/// spelling; verification treats a group as satisfied when one of them took.
+pub const ALIASES: &[&[&str]] = &[
+    // 6.9 (and 6.8 stable) folded the x86 name into the generic one.
+    &["CONFIG_CPU_MITIGATIONS", "CONFIG_SPECULATION_MITIGATIONS"],
+    &["CONFIG_MITIGATION_RETPOLINE", "CONFIG_RETPOLINE"],
+    // 6.17 turned the GCC-plugin stackleak into compiler-agnostic KSTACK_ERASE.
+    &["CONFIG_KSTACK_ERASE", "CONFIG_GCC_PLUGIN_STACKLEAK"],
+];
+
+/// A host tool some selected option depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Need {
+    pub tweak: String,
+    pub label: String,
+    pub tool: &'static str,
+}
 
 #[derive(Debug, Clone)]
 pub struct Conflict {
@@ -899,6 +969,33 @@ pub struct Resolved {
     pub unknown: Vec<String>,
     pub localmodconfig: bool,
     pub risk: Risk,
+    /// Which tweak (or [`EXTRA`]) is responsible for each symbol.
+    pub origin: BTreeMap<String, String>,
+    /// Host tools the selected options need.
+    pub needs: Vec<Need>,
+}
+
+impl Resolved {
+    /// LTO is clang-only, so selecting it means the build must use LLVM=1.
+    pub fn needs_clang(&self) -> bool {
+        self.needs.iter().any(|n| n.tool == "clang")
+    }
+
+    /// Notes for needed tools that `has_tool` says are missing.
+    pub fn missing_tool_notes(&self, has_tool: impl Fn(&str) -> bool) -> Vec<Note> {
+        self.needs
+            .iter()
+            .filter(|n| !has_tool(n.tool))
+            .map(|n| Note {
+                tweak: n.tweak.clone(),
+                level: "caution".into(),
+                text: format!(
+                    "{} needs '{}', which is not installed. Without it kbuild will drop the option.",
+                    n.label, n.tool
+                ),
+            })
+            .collect()
+    }
 }
 
 impl Resolved {
@@ -907,6 +1004,7 @@ impl Resolved {
             ("symbol_count", Json::u(self.fragment.len())),
             ("risk", Json::s(self.risk.as_str())),
             ("localmodconfig", Json::b(self.localmodconfig)),
+            ("needs_clang", Json::b(self.needs_clang())),
             ("fragment_text", Json::s(fragment_text(&self.fragment))),
             (
                 "fragment",
@@ -1031,6 +1129,13 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
             out.localmodconfig = true;
         }
         out.risk = out.risk.max(o.risk);
+        for tool in &o.needs {
+            out.needs.push(Need {
+                tweak: t.id.to_string(),
+                label: format!("{} / {}", t.title, o.label),
+                tool,
+            });
+        }
         if !o.note.is_empty() {
             out.notes.push(Note {
                 tweak: t.id.to_string(),
@@ -1084,6 +1189,10 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
     }
     out.unknown.sort();
     out.unknown.dedup();
+    out.origin = origin
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string()))
+        .collect();
     out
 }
 
@@ -1357,6 +1466,37 @@ mod tests {
     fn unknown_selections_are_surfaced() {
         let r = resolve(&sel(&[("nonsense", "x"), ("preempt", "sideways")]));
         assert_eq!(r.unknown, vec!["nonsense", "preempt=sideways"]);
+    }
+
+    #[test]
+    fn tool_requirements_are_tracked_and_reported_when_missing() {
+        let r = resolve(&sel(&[("debug_info", "btf"), ("lto", "thin"), ("preempt", "full")]));
+        let tools: Vec<&str> = r.needs.iter().map(|n| n.tool).collect();
+        assert_eq!(tools, vec!["pahole", "clang", "ld.lld"]);
+        assert!(r.needs_clang());
+
+        // Only the tools the host lacks produce a note.
+        let notes = r.missing_tool_notes(|tool| tool != "pahole");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].text.contains("'pahole'"), "{}", notes[0].text);
+        assert!(r.missing_tool_notes(|_| true).is_empty());
+
+        assert!(!resolve(&sel(&[("preempt", "full")])).needs_clang());
+    }
+
+    #[test]
+    fn alias_groups_only_name_symbols_the_catalog_uses() {
+        let all: Vec<&str> = tweaks()
+            .iter()
+            .flat_map(|t| t.opts.iter())
+            .flat_map(|o| o.sets.iter().map(|(s, _)| *s))
+            .collect();
+        for group in ALIASES {
+            assert!(group.len() >= 2);
+            for sym in *group {
+                assert!(all.contains(sym), "alias {sym} is not set by any option");
+            }
+        }
     }
 
     #[test]
