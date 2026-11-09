@@ -1,0 +1,23 @@
+[package]
+name = "kertweaker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Tweak a Linux kernel from a GUI and build it for your own machine"
+license = "MIT"
+repository = "https://github.com/clrealy/kertweaker"
+readme = "README.md"
+keywords = ["linux", "kernel", "kconfig", "build", "gui"]
+categories = ["command-line-utilities"]
+
+# No dependencies, on purpose: kertweaker is a single std-only binary, so it
+# builds offline in seconds and pulls in nothing you have to trust. The heavy
+# lifting is delegated to the tools a kernel build already requires
+# (make, tar, gzip, curl).
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+panic = "abort"
