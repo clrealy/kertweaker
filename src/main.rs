@@ -12,6 +12,12 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+// A tiny wrapper around libc's `signal` for SIGPIPE, so we do not pull in
+// the `libc` crate just to end gracefully when a pipe reader walks away.
+extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+}
+
 const DEFAULT_PORT: u16 = 7878;
 
 const HELP: &str = "\
@@ -184,6 +190,13 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // Piping into head, less or grep closes stdout mid-run. Rust's default
+    // is to panic on the next print; that is loud and not useful. Treating
+    // the reader walking away as a plain exit matches what every other CLI
+    // does. SIGPIPE is 13; SIG_DFL is 0.
+    // SAFETY: setting a signal handler is a libc call with no preconditions.
+    unsafe { signal(13, 0) };
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
