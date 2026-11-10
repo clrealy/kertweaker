@@ -88,8 +88,24 @@ app does two things:
 ![Apps and the kernel options each one needs](docs/software.png)
 
 Built in: Flatpak, Steam, Wine, Docker, Podman, QEMU/KVM + virt-manager,
-Waydroid, OBS Studio, WireGuard tools, GIMP, VLC and Discord. Apps that need
-nothing special from the kernel (GIMP, VLC, Discord) only join the install list.
+Waydroid, OBS Studio, WireGuard tools, GIMP, VLC, Discord and gurt. Apps that
+need nothing special from the kernel (GIMP, VLC, Discord, gurt) only join the
+install list.
+
+gurt, the gurt package manager, has no distribution package: it installs with
+its own script from `gurtproject.org`. kertweaker has not vetted that script and
+never runs it. The plan it prints fetches the script to a file and runs it as a
+separate step, so you can read it first:
+
+```bash
+curl -fsSL https://gurtproject.org/install.sh -o gurt-install.sh
+```
+
+```bash
+sh gurt-install.sh
+```
+
+![The install plan with gurt: fetch the script, then run it, with a note to read it first](docs/gurt.png)
 
 Any other package name can be added too. kertweaker asks your package manager
 whether each name exists: an app whose native package is not in your enabled

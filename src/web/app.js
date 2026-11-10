@@ -627,7 +627,9 @@
       const on = S.software.includes(a.id);
       const sets = Object.entries(a.kernel);
       const how = a.packages.length ? a.packages.join(' ')
-        : a.flatpak ? `Flatpak ${a.flatpak}` : 'no package known for this distribution';
+        : a.flatpak ? `Flatpak ${a.flatpak}`
+        : a.script ? `a script from ${a.script_host}` : 'no package known for this distribution';
+      const scripted = !a.packages.length && !a.flatpak && a.script;
       return h('label', { class: 'card app' + (on ? ' changed' : '') },
         h('input', { type: 'checkbox', checked: on, onchange: (e) => { toggleApp(a.id, e.target.checked); render(); } }),
         h('div', { class: 'app-body' },
@@ -637,6 +639,9 @@
             sets.length ? `Turns on ${sets.length} kernel option${sets.length === 1 ? '' : 's'}` : 'No kernel changes needed',
             ' · installs ', h('code', {}, how)),
           on && a.note ? h('p', { class: 'note' }, a.note) : null,
+          scripted
+            ? h('p', { class: 'note' }, `Installs by running a script from ${a.script_host}. kertweaker has not checked that script and never runs it: you get the commands, and can read the script first.`)
+            : null,
           sets.length
             ? h('details', { onclick: (e) => e.stopPropagation() },
                 h('summary', {}, `Show the ${sets.length} kernel option${sets.length === 1 ? '' : 's'}`),

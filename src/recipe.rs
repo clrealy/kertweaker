@@ -496,7 +496,7 @@ mod tests {
             "base": { "mode": "file", "path": "/etc/shadow" },
             "tweaks": { "preempt": "full", "nonsense": "x", "hz": "9999", "nr_cpus": 16 },
             "extra_options": ["CONFIG_OK=y", "rm -rf /", "$(reboot)"],
-            "software": ["steam", "gurt", "bad name; reboot"],
+            "software": ["steam", "zzqx-nope", "bad name; reboot"],
             "packages": ["htop", "gimp && reboot", "-o", "$(id)"],
             "build": { "output": "exe", "clang": true }
         }"#;
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(r.extra, "CONFIG_OK=y\n");
         assert_eq!(r.software, vec!["steam"]);
         // An unknown-but-harmless name is kept as a package to look up later.
-        assert_eq!(r.packages, vec!["gurt", "htop"]);
+        assert_eq!(r.packages, vec!["zzqx-nope", "htop"]);
         assert_eq!(r.output, None);
         assert!(r.llvm);
 
@@ -526,7 +526,7 @@ mod tests {
             "no option \"9999\"",
             "not text",
             "were not config options",
-            "\"gurt\" is not software kertweaker knows",
+            "\"zzqx-nope\" is not software kertweaker knows",
             "Ignored software entry",
             "Ignored package \"gimp && reboot\"",
             "unknown output format",
@@ -562,6 +562,21 @@ mod tests {
         assert_eq!(r.selections.len(), 1);
         assert!(warnings[0].contains("newer kertweaker"));
         assert!(warnings.iter().any(|w| w.contains("quantum_scheduler")));
+    }
+
+    #[test]
+    fn gurt_is_software_a_file_can_ask_for() {
+        let text = r#"{"format":"kertweaker.kernel","version":1,"software":["gurt","steam"]}"#;
+        let (r, warnings) = parse(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(r.software, vec!["gurt", "steam"]);
+        assert!(r.packages.is_empty());
+        // A file can only name the app. Where its installer comes from is
+        // fixed in kertweaker, so a shared file cannot point it elsewhere.
+        let sneaky = r#"{"format":"kertweaker.kernel","version":1,"software":["gurt"],
+                         "script":"https://evil.example/x.sh","scripts":{"gurt":"https://evil.example/x.sh"}}"#;
+        let (r2, _) = parse(sneaky).unwrap();
+        assert!(!r2.render().contains("evil.example"));
     }
 
     #[test]

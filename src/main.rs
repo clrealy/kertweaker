@@ -285,6 +285,10 @@ fn cmd_gui(args: &Args) -> Result<(), String> {
         println!("(opened in your browser)");
     }
 
+    // List the distribution's packages in the background, so the first
+    // "is this installable?" check on the Review page does not wait for it.
+    std::thread::spawn(software::warm_cache);
+
     let handler_app = app.clone();
     http::serve(listener, move |req| -> Reply {
         api::handle(&handler_app, req)
@@ -447,10 +451,11 @@ fn cmd_apps() {
             }
         );
         let pkgs = a.packages(family);
-        let how = match (pkgs.is_empty(), a.flatpak) {
-            (false, _) => pkgs.join(" "),
-            (true, Some(id)) => format!("flatpak {id}"),
-            (true, None) => "no package known for this distribution".to_string(),
+        let how = match (pkgs.is_empty(), a.flatpak, a.script) {
+            (false, _, _) => pkgs.join(" "),
+            (true, Some(id), _) => format!("flatpak {id}"),
+            (true, None, Some(url)) => format!("its own script, {url} (read it before running)"),
+            (true, None, None) => "no package known for this distribution".to_string(),
         };
         println!("      installs:       {how}");
         println!();

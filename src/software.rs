@@ -14,8 +14,10 @@
 
 use crate::catalog::{self, Requirement, Resolved, M, Y};
 use crate::json::Json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 type Sets = &'static [(&'static str, Option<&'static str>)];
 
@@ -30,6 +32,11 @@ pub struct App {
     pub arch: &'static [&'static str],
     /// Flathub application id, used when there is no native package.
     pub flatpak: Option<&'static str>,
+    /// For software that only ships as an installer script: its https URL.
+    ///
+    /// kertweaker never fetches or runs these. The plan it prints downloads
+    /// the script to a file first, so it can be read before it is run.
+    pub script: Option<&'static str>,
     pub note: &'static str,
 }
 
@@ -65,6 +72,7 @@ pub const APPS: &[App] = &[
         rpm: &["flatpak"],
         arch: &["flatpak"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -105,6 +113,7 @@ pub const APPS: &[App] = &[
         rpm: &["steam"],
         arch: &["steam"],
         flatpak: Some("com.valvesoftware.Steam"),
+        script: None,
         note: "The native package lives in an extra repository: multiverse on Ubuntu, non-free on Debian, RPM Fusion on Fedora, multilib on Arch.",
     },
     App {
@@ -116,6 +125,7 @@ pub const APPS: &[App] = &[
         rpm: &["wine"],
         arch: &["wine"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -162,6 +172,7 @@ pub const APPS: &[App] = &[
         rpm: &["moby-engine"],
         arch: &["docker"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -192,6 +203,7 @@ pub const APPS: &[App] = &[
         rpm: &["podman"],
         arch: &["podman"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -214,6 +226,7 @@ pub const APPS: &[App] = &[
         rpm: &["qemu-kvm", "libvirt", "virt-manager"],
         arch: &["qemu-full", "libvirt", "virt-manager"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -237,6 +250,7 @@ pub const APPS: &[App] = &[
         rpm: &["waydroid"],
         arch: &[],
         flatpak: None,
+        script: None,
         note: "Waydroid ships from its own repository on Debian and Ubuntu, and from the AUR on Arch.",
     },
     App {
@@ -255,6 +269,7 @@ pub const APPS: &[App] = &[
         rpm: &["obs-studio"],
         arch: &["obs-studio"],
         flatpak: Some("com.obsproject.Studio"),
+        script: None,
         note: "",
     },
     App {
@@ -266,6 +281,7 @@ pub const APPS: &[App] = &[
         rpm: &["wireguard-tools"],
         arch: &["wireguard-tools"],
         flatpak: None,
+        script: None,
         note: "",
     },
     App {
@@ -277,6 +293,7 @@ pub const APPS: &[App] = &[
         rpm: &["gimp"],
         arch: &["gimp"],
         flatpak: Some("org.gimp.GIMP"),
+        script: None,
         note: "",
     },
     App {
@@ -288,6 +305,7 @@ pub const APPS: &[App] = &[
         rpm: &["vlc"],
         arch: &["vlc"],
         flatpak: Some("org.videolan.VLC"),
+        script: None,
         note: "",
     },
     App {
@@ -299,6 +317,19 @@ pub const APPS: &[App] = &[
         rpm: &[],
         arch: &["discord"],
         flatpak: Some("com.discordapp.Discord"),
+        script: None,
+        note: "",
+    },
+    App {
+        id: "gurt",
+        title: "gurt",
+        desc: "The gurt package manager. No distribution packages it, so it installs with its own script from gurtproject.org.",
+        kernel: &[],
+        deb: &[],
+        rpm: &[],
+        arch: &[],
+        flatpak: None,
+        script: Some("https://gurtproject.org/install.sh"),
         note: "",
     },
 ];
@@ -373,6 +404,92 @@ pub fn parse_packages(text: &str) -> (Vec<String>, Vec<String>) {
     (good, bad)
 }
 
+/// How long a package list or a per-package answer is trusted before asking
+/// the package manager again.
+const INDEX_TTL: Duration = Duration::from_secs(600);
+
+/// Every package name the distribution knows, loaded with one command.
+///
+/// Asking per package is far too slow to do on every preview: `apt-cache`
+/// can spend over a second rebuilding its cache on each call, so a dozen names
+/// meant a dozen seconds. One listing, kept in memory, makes each lookup free.
+struct Index {
+    family: String,
+    names: Option<Arc<HashSet<String>>>,
+    loaded: Instant,
+}
+
+static INDEX: Mutex<Option<Index>> = Mutex::new(None);
+/// A remembered answer and when it was given.
+type Remembered = (Option<bool>, Instant);
+static PER_PACKAGE: Mutex<Option<HashMap<String, Remembered>>> = Mutex::new(None);
+
+fn run_stdout(cmd: &str, args: &[&str]) -> Option<(bool, String)> {
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    Some((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// Turn a package manager's one-name-per-line listing into a set.
+fn parse_names(listing: &str) -> HashSet<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `package` is in a listing. A Debian `name:arch` qualifier is
+/// ignored, since listings carry bare names.
+fn listed(names: &HashSet<String>, package: &str) -> bool {
+    let bare = package.split(':').next().unwrap_or(package);
+    names.contains(bare)
+}
+
+/// The full package list for a family, or `None` if it cannot be listed.
+fn package_index(family: &str) -> Option<Arc<HashSet<String>>> {
+    let mut slot = INDEX.lock().ok()?;
+    if let Some(index) = slot.as_ref() {
+        if index.family == family && index.loaded.elapsed() < INDEX_TTL {
+            return index.names.clone();
+        }
+    }
+    let listing = match family {
+        // Real packages only: virtual names and missing dependencies are
+        // left out unless --all-names is given.
+        "deb" => run_stdout("apt-cache", &["pkgnames"]),
+        "arch" => run_stdout("pacman", &["-Slq"]),
+        _ => None,
+    };
+    let names = listing
+        .filter(|(ok, _)| *ok)
+        .map(|(_, text)| parse_names(&text))
+        // An empty list means the package cache was never downloaded, which
+        // says nothing about whether any particular package exists.
+        .filter(|set| !set.is_empty())
+        .map(Arc::new);
+    *slot = Some(Index {
+        family: family.to_string(),
+        names: names.clone(),
+        loaded: Instant::now(),
+    });
+    names
+}
+
+/// Load the package list ahead of time, so the first preview is not the one
+/// that pays for it.
+pub fn warm_cache() {
+    let _ = package_index(crate::system::package_family());
+}
+
 /// Whether the distribution's package manager knows a package.
 ///
 /// `None` means "could not tell" (no supported package manager, or its cache
@@ -381,36 +498,27 @@ pub fn available(family: &str, package: &str) -> Option<bool> {
     if !valid_package(package) {
         return Some(false);
     }
-    let run = |cmd: &str, args: &[&str]| -> Option<(bool, String)> {
-        let out = Command::new(cmd)
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        Some((
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        ))
-    };
     match family {
-        "deb" => {
-            // An empty package cache proves nothing either way.
-            let (_, stats) = run("apt-cache", &["stats"])?;
-            if stats.contains("Total package names: 0") || stats.trim().is_empty() {
-                return None;
-            }
-            let (ok, text) = run("apt-cache", &["show", "--no-all-versions", package])?;
-            Some(ok && text.contains("Package:"))
-        }
-        "arch" => run("pacman", &["-Si", package]).map(|(ok, _)| ok),
+        "deb" | "arch" => package_index(family).map(|names| listed(&names, package)),
         "rpm" => {
-            // -C: cache only, so this never blocks on the network.
-            let (ok, text) = run("dnf", &["-q", "-C", "repoquery", package])?;
-            if !ok {
-                return None;
+            // dnf has no cheap full listing, so ask per package and remember.
+            if let Ok(memo) = PER_PACKAGE.lock() {
+                if let Some((answer, at)) = memo.as_ref().and_then(|m| m.get(package)) {
+                    if at.elapsed() < INDEX_TTL {
+                        return *answer;
+                    }
+                }
             }
-            Some(!text.trim().is_empty())
+            // -C: cache only, so this never blocks on the network.
+            let answer = match run_stdout("dnf", &["-q", "-C", "repoquery", package]) {
+                Some((true, text)) => Some(!text.trim().is_empty()),
+                _ => None,
+            };
+            if let Ok(mut memo) = PER_PACKAGE.lock() {
+                memo.get_or_insert_with(HashMap::new)
+                    .insert(package.to_string(), (answer, Instant::now()));
+            }
+            answer
         }
         _ => None,
     }
@@ -455,13 +563,29 @@ pub fn plan(
     let mut out = Plan::default();
     let mut native: Vec<String> = Vec::new();
     let mut flatpaks: Vec<&str> = Vec::new();
+    let mut scripts: Vec<&App> = Vec::new();
     let push = |list: &mut Vec<String>, name: &str| {
         if !list.iter().any(|n| n == name) {
             list.push(name.to_string());
         }
     };
 
-    for id in software {
+    // A package name the distribution does not have, but which is an app
+    // kertweaker knows how to install some other way, is treated as that app:
+    // typing "gurt" or "discord" should work, not be reported as missing.
+    let mut ids: Vec<&str> = software.iter().map(String::as_str).collect();
+    let mut plain: Vec<&String> = Vec::new();
+    for name in packages {
+        if app(name).is_some() && check(name) != Some(true) {
+            if !ids.contains(&name.as_str()) {
+                ids.push(name);
+            }
+        } else {
+            plain.push(name);
+        }
+    }
+
+    for id in ids {
         let Some(a) = app(id) else { continue };
         let pkgs = a.packages(family);
         let usable = !pkgs.is_empty() && pkgs.iter().all(|p| check(p) != Some(false));
@@ -477,6 +601,10 @@ pub fn plan(
                     a.title, a.note
                 ));
             }
+        } else if a.script.is_some() {
+            if !scripts.iter().any(|s| s.id == a.id) {
+                scripts.push(a);
+            }
         } else {
             out.not_found.push(a.title.to_string());
             out.notes.push(if a.note.is_empty() {
@@ -490,7 +618,7 @@ pub fn plan(
         }
     }
 
-    for name in packages {
+    for name in plain {
         if !valid_package(name) {
             continue;
         }
@@ -525,7 +653,35 @@ pub fn plan(
         out.commands
             .push(format!("flatpak install -y flathub {}", flatpaks.join(" ")));
     }
+    // Installer scripts come last and in two steps - fetch, then run - so the
+    // script sits on disk to be read first. Never `curl | sh`: that runs
+    // whatever the server sends, unseen.
+    for a in scripts {
+        let Some(url) = a.script else { continue };
+        let file = script_file(a);
+        out.commands.push(format!("curl -fsSL {url} -o {file}"));
+        out.commands.push(format!("sh {file}"));
+        out.notes.push(format!(
+            "{} installs with a script downloaded from {}. kertweaker has not seen that script \
+             and cannot vouch for it: read {file} before you run it.",
+            a.title,
+            script_host(url)
+        ));
+    }
     out
+}
+
+/// The local file name an app's installer script is saved under.
+pub fn script_file(a: &App) -> String {
+    format!("{}-install.sh", a.id)
+}
+
+/// The host part of a script URL, for telling the user where it comes from.
+pub fn script_host(url: &str) -> &str {
+    url.trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
 }
 
 pub fn to_json(family: &str) -> Json {
@@ -539,6 +695,8 @@ pub fn to_json(family: &str) -> Json {
                     ("note", Json::s(a.note)),
                     ("packages", Json::strs(a.packages(family).to_vec())),
                     ("flatpak", Json::opt_s(a.flatpak)),
+                    ("script", Json::opt_s(a.script)),
+                    ("script_host", Json::opt_s(a.script.map(script_host))),
                     (
                         "kernel",
                         Json::Obj(
@@ -587,7 +745,7 @@ mod tests {
             }
             // Every app can be installed somehow on a Debian-family system.
             assert!(
-                !a.deb.is_empty() || a.flatpak.is_some(),
+                !a.deb.is_empty() || a.flatpak.is_some() || a.script.is_some(),
                 "{} has no way to install on Debian/Ubuntu",
                 a.id
             );
@@ -654,8 +812,8 @@ mod tests {
 
     #[test]
     fn unknown_apps_are_surfaced() {
-        let r = resolve(&BTreeMap::new(), &ids(&["steam", "gurt"]), "");
-        assert_eq!(r.unknown, vec!["app:gurt"]);
+        let r = resolve(&BTreeMap::new(), &ids(&["steam", "zzqx-nope"]), "");
+        assert_eq!(r.unknown, vec!["app:zzqx-nope"]);
     }
 
     #[test]
@@ -691,6 +849,23 @@ mod tests {
     }
 
     #[test]
+    fn package_listings_are_parsed_and_searched() {
+        let names = parse_names("gimp\n  htop \n\nlibc6\nwine\n");
+        assert_eq!(names.len(), 4);
+        assert!(listed(&names, "gimp"));
+        assert!(listed(&names, "htop"));
+        // A Debian architecture qualifier still finds the bare name.
+        assert!(listed(&names, "wine:i386"));
+        assert!(!listed(&names, "gurt"));
+        assert!(!listed(&names, "gim"));
+        assert!(parse_names("").is_empty());
+        // An invalid name is never looked up at all.
+        assert_eq!(available("deb", "gimp; reboot"), Some(false));
+        // A family with no supported package manager cannot be checked.
+        assert_eq!(available("unknown", "gimp"), None);
+    }
+
+    #[test]
     fn plan_prefers_native_packages() {
         let everything = |_: &str| Some(true);
         let p = plan(
@@ -711,11 +886,11 @@ mod tests {
 
     #[test]
     fn plan_falls_back_to_flatpak_and_skips_unknown_names() {
-        // steam-installer is not in the enabled repos; "gurt" does not exist.
-        let check = |name: &str| Some(!matches!(name, "steam-installer" | "gurt"));
+        // steam-installer is not in the enabled repos; "zzqx-nope" does not exist.
+        let check = |name: &str| Some(!matches!(name, "steam-installer" | "zzqx-nope"));
         let p = plan(
             &ids(&["steam", "gimp"]),
-            &ids(&["gurt", "htop"]),
+            &ids(&["zzqx-nope", "htop"]),
             "deb",
             &check,
         );
@@ -727,14 +902,93 @@ mod tests {
                 "flatpak install -y flathub com.valvesoftware.Steam",
             ]
         );
-        assert_eq!(p.not_found, vec!["gurt"]);
+        assert_eq!(p.not_found, vec!["zzqx-nope"]);
         assert!(p
             .notes
             .iter()
             .any(|n| n.contains("Steam") && n.contains("Flatpak")));
-        assert!(p.notes.iter().any(|n| n.contains("'gurt'")));
+        assert!(p.notes.iter().any(|n| n.contains("'zzqx-nope'")));
         // The unknown name is nowhere in what gets run.
-        assert!(!p.commands.iter().any(|c| c.contains("gurt")));
+        assert!(!p.commands.iter().any(|c| c.contains("zzqx-nope")));
+    }
+
+    #[test]
+    fn gurt_installs_with_its_script_in_two_readable_steps() {
+        let nothing_native = |name: &str| Some(name != "gurt");
+        let p = plan(&ids(&["gurt", "gimp"]), &[], "deb", &nothing_native);
+        assert_eq!(
+            p.commands,
+            vec![
+                "sudo apt install -y gimp",
+                "curl -fsSL https://gurtproject.org/install.sh -o gurt-install.sh",
+                "sh gurt-install.sh",
+            ]
+        );
+        assert!(
+            p.not_found.is_empty(),
+            "gurt is a known app, not a missing package"
+        );
+        // The user is told it is an unvetted script and where it comes from.
+        let note = p.notes.iter().find(|n| n.contains("gurt")).unwrap();
+        assert!(
+            note.contains("gurtproject.org") && note.contains("read gurt-install.sh"),
+            "{note}"
+        );
+        // Fetched to a file, never piped straight into a shell.
+        assert!(
+            !p.commands.iter().any(|c| c.contains('|')),
+            "{:?}",
+            p.commands
+        );
+    }
+
+    #[test]
+    fn gurt_typed_as_a_package_name_means_the_gurt_app() {
+        let no_gurt_package = |name: &str| Some(name != "gurt");
+        let typed = plan(&[], &ids(&["gurt", "htop"]), "deb", &no_gurt_package);
+        assert_eq!(
+            typed.commands,
+            vec![
+                "sudo apt install -y htop",
+                "curl -fsSL https://gurtproject.org/install.sh -o gurt-install.sh",
+                "sh gurt-install.sh",
+            ]
+        );
+        assert!(typed.not_found.is_empty());
+
+        // Listed both ways, it is still installed once.
+        let both = plan(&ids(&["gurt"]), &ids(&["gurt"]), "deb", &no_gurt_package);
+        assert_eq!(both.commands.len(), 2);
+
+        // If a distribution ever does package something called gurt, an
+        // explicit package name means that package.
+        let packaged = plan(&[], &ids(&["gurt"]), "deb", &|_| Some(true));
+        assert_eq!(packaged.commands, vec!["sudo apt install -y gurt"]);
+    }
+
+    #[test]
+    fn installer_scripts_are_https_and_shell_safe() {
+        for a in APPS {
+            let Some(url) = a.script else { continue };
+            assert!(url.starts_with("https://"), "{}: {url} must be https", a.id);
+            assert!(
+                url.bytes()
+                    .all(|b| b.is_ascii_alphanumeric()
+                        || matches!(b, b':' | b'/' | b'.' | b'-' | b'_')),
+                "{}: {url} has characters a shell could interpret",
+                a.id
+            );
+            assert!(valid_package(&script_file(a)), "{}", script_file(a));
+            assert!(!script_host(url).is_empty() && !script_host(url).contains('/'));
+        }
+        assert_eq!(
+            script_host("https://gurtproject.org/install.sh"),
+            "gurtproject.org"
+        );
+        assert_eq!(
+            app("gurt").unwrap().script,
+            Some("https://gurtproject.org/install.sh")
+        );
     }
 
     #[test]
