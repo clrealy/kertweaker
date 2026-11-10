@@ -774,6 +774,14 @@ fn build_catalog() -> Vec<Tweak> {
                 .note("Breaks DKMS modules such as the NVIDIA or VirtualBox drivers."))
             .opt(opt("off", "Keep all symbols", "", &[("CONFIG_TRIM_UNUSED_KSYMS", OFF)])),
 
+        Tweak::new("werror", "size", "Treat compiler warnings as errors",
+            "The kernel's own default is on. Turn it off if a new compiler flags warnings the kernel has not yet fixed - a common sticking point on older stable trees with newer gcc.")
+            .toggle()
+            .opt(opt("on", "On (kernel default)", "", &[("CONFIG_WERROR", Y)]))
+            .opt(opt("off", "Off", "Lets the build continue through warnings. Use when a new gcc or clang trips an unfixed warning in an older stable kernel.",
+                &[("CONFIG_WERROR", OFF)])
+                .note("Linux 6.8 and gcc 13 produce a 'missing-prototypes' error on security.c that CONFIG_WERROR turns into a build failure. Turn this off there.")),
+
         Tweak::new("kernel_debugging", "size", "Kernel debugging and tracing",
             "ftrace, kprobes and eBPF. Keep them unless you are chasing the last bit of performance: plenty of tooling needs them.")
             .opt(opt("full", "Tracing + eBPF (recommended)", "",

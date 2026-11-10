@@ -21,12 +21,22 @@ builds the kernel, and tells you about anything kbuild refused to apply.
 ## Quick start
 
 ```bash
+gurt install kertweaker
+```
+
+Or from source:
+
+```bash
 cargo build --release
 ```
 
 ```bash
 ./target/release/kertweaker
 ```
+
+The gurt install uses the script in [`packaging/gurt/`](packaging/gurt/),
+which clones this repository, builds the release binary and installs it to
+`/usr/local/bin/kertweaker`.
 
 It prints a link such as `http://127.0.0.1:7878/?token=...`. Open it (it opens
 by itself when there is a desktop session), then:

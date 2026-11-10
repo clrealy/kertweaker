@@ -1,0 +1,30 @@
+# kertweaker package for gurt.
+#
+# This is a plain-text manifest so gurt (and anything else that reads it) can
+# find kertweaker without parsing. A gurt client that does not know these
+# fields can still run install.sh directly.
+
+name = kertweaker
+version = 0.2.0
+summary = Tweak a Linux kernel from a GUI and build it for this machine.
+license = MIT
+homepage = https://github.com/clrealy/kertweaker
+
+# The script is installed in two readable steps, the way kertweaker's own gurt
+# entry does it. That lets a user read the script before running it.
+install_script = https://raw.githubusercontent.com/clrealy/kertweaker/main/packaging/gurt/install.sh
+install_sha256 =
+
+# Where the installed program lives. Override with PREFIX when running the
+# script by hand.
+binary = /usr/local/bin/kertweaker
+
+# What has to be on the machine first. Everything below is what kertweaker's
+# own `doctor` command checks for, grouped the way distributions name them.
+depends = git, cargo
+build_depends_deb = gcc, make, flex, bison, bc, libssl-dev, tar, xz-utils, gzip, kmod, libelf-dev, libncurses-dev
+build_depends_rpm = gcc, make, flex, bison, bc, openssl-devel, tar, xz, gzip, kmod, elfutils-libelf-devel, ncurses-devel
+build_depends_arch = gcc, make, flex, bison, bc, openssl, tar, xz, gzip, kmod, libelf, ncurses
+
+# Uninstall: delete the binary and the source clone. Nothing else to undo.
+uninstall = rm -f /usr/local/bin/kertweaker && rm -rf ~/.local/share/kertweaker/src
