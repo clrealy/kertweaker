@@ -233,6 +233,22 @@ textarea { font-family: var(--mono); font-size: 13px; min-height: 110px; resize:
 .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .spacer { flex: 1; }
 
+/* ---------------------------------------------------------------- software */
+.app-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; align-items: start; }
+.card.app { display: grid; grid-template-columns: 20px 1fr; gap: 10px; cursor: pointer; align-items: start; }
+.card.app input { margin-top: 4px; accent-color: var(--accent); }
+.card.app:hover { border-color: var(--accent); }
+.app-body { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.app-body .meta { color: var(--muted); font-size: 13px; }
+.app-body .note { color: var(--caution); font-size: 14px; }
+.app-body .symbols { margin-top: 8px; }
+.app-body details > summary { font-weight: 400; font-size: 13px; color: var(--accent); }
+.app-body details[open] > summary { margin-bottom: 0; }
+.head-actions { margin-top: 12px; }
+.head-actions .empty { margin-top: 0; }
+.card.loaded { border-color: var(--accent); }
+[hidden] { display: none !important; }
+
 /* ----------------------------------------------------------------- summary */
 .summary .card { padding: 14px; }
 .summary h2 { font-size: 15px; }

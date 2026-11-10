@@ -98,6 +98,20 @@ impl Json {
     pub fn bool_or(&self, key: &str, default: bool) -> bool {
         self.get(key).and_then(Json::as_bool).unwrap_or(default)
     }
+    /// Read an array of strings, ignoring anything else in it.
+    pub fn str_list(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .and_then(Json::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Read an object of `{string: string}` into a sorted map.
     pub fn string_map(&self, key: &str) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
@@ -112,6 +126,49 @@ impl Json {
     }
 
     // ------------------------------------------------------------- rendering
+    /// Indented rendering, for files a person will read and edit.
+    pub fn pretty(&self) -> String {
+        let mut out = String::new();
+        self.write_pretty(&mut out, 0);
+        out.push('\n');
+        out
+    }
+
+    fn write_pretty(&self, out: &mut String, depth: usize) {
+        let pad = |out: &mut String, d: usize| out.push_str(&"  ".repeat(d));
+        match self {
+            Json::Arr(items) if !items.is_empty() => {
+                out.push_str("[\n");
+                for (i, item) in items.iter().enumerate() {
+                    pad(out, depth + 1);
+                    item.write_pretty(out, depth + 1);
+                    if i + 1 < items.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Obj(pairs) if !pairs.is_empty() => {
+                out.push_str("{\n");
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    pad(out, depth + 1);
+                    escape(k, out);
+                    out.push_str(": ");
+                    v.write_pretty(out, depth + 1);
+                    if i + 1 < pairs.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push('}');
+            }
+            other => other.write(out),
+        }
+    }
+
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -455,6 +512,22 @@ mod tests {
         escape(&input, &mut out);
         assert_eq!(out, "\"a\\u2028b\\u2029c\\u0001\"");
         assert!(!out.contains('\u{2028}'));
+    }
+
+    #[test]
+    fn pretty_output_is_readable_and_reparses() {
+        let v = Json::obj(vec![
+            ("name", Json::s("x")),
+            ("list", Json::strs(["a", "b"])),
+            ("empty", Json::arr(vec![])),
+            ("nested", Json::obj(vec![("k", Json::u(1))])),
+        ]);
+        let text = v.pretty();
+        assert_eq!(
+            text,
+            "{\n  \"name\": \"x\",\n  \"list\": [\n    \"a\",\n    \"b\"\n  ],\n  \"empty\": [],\n  \"nested\": {\n    \"k\": 1\n  }\n}\n"
+        );
+        assert_eq!(parse(&text).unwrap(), v);
     }
 
     #[test]

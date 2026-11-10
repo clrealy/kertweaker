@@ -11,7 +11,8 @@ use crate::catalog;
 use crate::http::{self, Reply, Request, Response};
 use crate::json::{self, Json};
 use crate::kconfig::{self, Config};
-use crate::{sources, system};
+use crate::recipe::{self, Recipe};
+use crate::{software, sources, system};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -32,6 +33,8 @@ pub struct App {
     pub token: String,
     pub port: u16,
     pub registry: Registry,
+    /// A `.kernel` file given on the command line, loaded into the page at start.
+    pub preload: Option<(Recipe, Vec<String>)>,
 }
 
 impl App {
@@ -41,6 +44,7 @@ impl App {
             token: new_token(),
             port,
             registry: Registry::new(),
+            preload: None,
         }
     }
 
@@ -174,7 +178,22 @@ pub fn handle(app: &Arc<App>, req: &Request) -> Reply {
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
     match (method, segments.as_slice()) {
         ("GET", ["system"]) => ok(system::describe(&app.workdir)),
-        ("GET", ["catalog"]) => ok(catalog::to_json()),
+        ("GET", ["catalog"]) => {
+            let mut doc = catalog::to_json();
+            if let Json::Obj(pairs) = &mut doc {
+                pairs.push((
+                    "software".to_string(),
+                    software::to_json(system::package_family()),
+                ));
+            }
+            ok(doc)
+        }
+        ("GET", ["preload"]) => ok(match &app.preload {
+            Some((r, warnings)) => recipe::to_state_json(r, warnings),
+            None => Json::Null,
+        }),
+        ("POST", ["kernelfile", "import"]) => with_body(req, import_kernel_file),
+        ("POST", ["kernelfile", "export"]) => with_body(req, export_kernel_file),
         ("GET", ["releases"]) => ok(sources::releases(&app.workdir)),
         ("GET", ["trees"]) => ok(Json::arr(sources::local_trees(
             &sources::default_search_dirs(&app.workdir),
@@ -353,10 +372,23 @@ fn load_base(base: &Base, tree: Option<&Path>) -> Result<(Config, String), Strin
 fn preview(_app: &Arc<App>, body: &Json) -> Reply {
     let selections = body.string_map("selections");
     let extra = body.str_or("extra", "");
-    let mut resolved = catalog::resolve_with_extra(&selections, extra);
+    let apps = body.str_list("software");
+    let (packages, bad_packages) = software::parse_packages(&body.str_list("packages").join(" "));
+    let mut resolved = software::resolve(&selections, &apps, extra);
     // Tell the user now, not after a long build, that a tool is missing.
     let missing = resolved.missing_tool_notes(|tool| system::which(tool).is_some());
     resolved.notes.extend(missing);
+    for name in &bad_packages {
+        resolved.notes.push(catalog::Note {
+            tweak: "packages".into(),
+            level: "error".into(),
+            text: format!("{name:?} is not a valid package name, so it is ignored."),
+        });
+    }
+    let family = system::package_family();
+    let plan = software::plan(&apps, &packages, family, &|p| {
+        software::available(family, p)
+    });
 
     let tree = match body.get("source") {
         Some(s) if s.str_or("mode", "") == "local" && !s.str_or("path", "").trim().is_empty() => {
@@ -389,7 +421,10 @@ fn preview(_app: &Arc<App>, body: &Json) -> Reply {
         }
     }
 
-    let mut pairs = vec![("resolved", resolved.to_json())];
+    let mut pairs = vec![
+        ("resolved", resolved.to_json()),
+        ("software_plan", plan.to_json()),
+    ];
     match loaded {
         Ok((base, description)) => {
             let mut next = base.clone();
@@ -476,11 +511,22 @@ fn start_build(app: &Arc<App>, body: &Json) -> Reply {
 
     let selections = body.string_map("selections");
     let extra = body.str_or("extra", "").to_string();
-    let resolved = catalog::resolve_with_extra(&selections, &extra);
+    let apps = body.str_list("software");
+    let (packages, bad_packages) = software::parse_packages(&body.str_list("packages").join(" "));
+    if !bad_packages.is_empty() {
+        return fail(
+            400,
+            format!("not valid package names: {}", bad_packages.join(", ")),
+        );
+    }
+    let resolved = software::resolve(&selections, &apps, &extra);
     if !resolved.unknown.is_empty() {
         return fail(
             400,
-            format!("unknown tweaks: {}", resolved.unknown.join(", ")),
+            format!(
+                "unknown tweaks or software: {}",
+                resolved.unknown.join(", ")
+            ),
         );
     }
     // Options that can cost someone their bootable machine need an explicit yes.
@@ -502,6 +548,8 @@ fn start_build(app: &Arc<App>, body: &Json) -> Reply {
         base,
         selections,
         extra,
+        software: apps,
+        packages,
         jobs,
         output: Output::parse(body.str_or("output", "image")),
         llvm: body.bool_or("llvm", false),
@@ -514,6 +562,90 @@ fn start_build(app: &Arc<App>, body: &Json) -> Reply {
     };
     let job = app.registry.start(req);
     ok(Json::obj(vec![("id", Json::s(job.id.clone()))]))
+}
+
+// ---------------------------------------------------------------- .kernel files
+
+/// Read a `.kernel` file's text and hand back what the page should load.
+/// Nothing is built or installed; the user still reviews and presses Build.
+fn import_kernel_file(body: &Json) -> Reply {
+    match recipe::parse(body.str_or("text", "")) {
+        Ok((r, warnings)) => ok(recipe::to_state_json(&r, &warnings)),
+        Err(e) => fail(400, e),
+    }
+}
+
+/// Turn the page's current state into the text of a `.kernel` file.
+fn export_kernel_file(body: &Json) -> Reply {
+    let Some(name) = recipe::clean_name(body.str_or("name", "my-kernel")) else {
+        return fail(
+            400,
+            "use a name of letters, digits, spaces, dashes or underscores",
+        );
+    };
+    let (packages, bad) = software::parse_packages(&body.str_list("packages").join(" "));
+    if !bad.is_empty() {
+        return fail(400, format!("not valid package names: {}", bad.join(", ")));
+    }
+    let apps: Vec<String> = body
+        .str_list("software")
+        .into_iter()
+        .filter(|id| software::app(id).is_some())
+        .collect();
+
+    // What the recipe starts from. A config that only exists on this machine
+    // (a pasted one, a file, a tree's .config) has to travel inside the file,
+    // or the recipe would mean nothing anywhere else.
+    let embed = body.bool_or("embed", false);
+    let tree = match body.get("source") {
+        Some(s) if s.str_or("mode", "") == "local" && !s.str_or("path", "").trim().is_empty() => {
+            Some(expand(s.str_or("path", "").trim()))
+        }
+        _ => None,
+    };
+    let base = match parse_base(body) {
+        Ok(Base::Defconfig) => recipe::Base::Defconfig,
+        Ok(Base::Running) if !embed => recipe::Base::Running,
+        Ok(b) => match load_base(&b, tree.as_deref()) {
+            Ok((config, _)) => recipe::Base::Embedded(config.render()),
+            Err(e) => return fail(400, format!("cannot read the starting config: {e}")),
+        },
+        Err(e) => return fail(400, e),
+    };
+    let embedded = matches!(base, recipe::Base::Embedded(_));
+
+    let version = body
+        .get("source")
+        .filter(|s| s.str_or("mode", "") == "download")
+        .map(|s| s.str_or("version", "").to_string())
+        .filter(|v| sources::valid_version(v));
+    let selections: std::collections::BTreeMap<String, String> = body
+        .string_map("selections")
+        .into_iter()
+        .filter(|(id, _)| catalog::tweak(id).is_some())
+        .collect();
+    let extra = catalog::fragment_text_ordered(&kconfig::parse_fragment(body.str_or("extra", "")));
+
+    let r = Recipe {
+        name,
+        description: body.str_or("description", "").chars().take(300).collect(),
+        kernel_version: version,
+        base,
+        selections,
+        extra,
+        software: apps,
+        packages,
+        output: match body.str_or("output", "") {
+            o @ ("image" | "deb" | "rpm") => Some(o.to_string()),
+            _ => None,
+        },
+        llvm: body.bool_or("llvm", false),
+    };
+    ok(Json::obj(vec![
+        ("filename", Json::s(r.file_name())),
+        ("text", Json::s(r.render())),
+        ("embedded", Json::b(embedded)),
+    ]))
 }
 
 /// Push job snapshots over SSE until the job finishes or the client leaves.
@@ -610,6 +742,8 @@ fn save_profile(workdir: &Path, body: &Json) -> Reply {
         ("name", Json::s(name.clone())),
         ("saved_at", Json::n(build::now_secs())),
         ("extra", Json::s(body.str_or("extra", ""))),
+        ("software", Json::strs(body.str_list("software"))),
+        ("packages", Json::strs(body.str_list("packages"))),
         (
             "selections",
             Json::Obj(

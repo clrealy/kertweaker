@@ -12,6 +12,8 @@ pub mod catalog;
 pub mod http;
 pub mod json;
 pub mod kconfig;
+pub mod recipe;
+pub mod software;
 pub mod sources;
 pub mod system;
 

@@ -80,6 +80,10 @@
     search: '',
     selections: {},
     extra: '',
+    software: [],
+    packages: '',
+    name: '',
+    loaded: null,
     source: { mode: 'download', version: '', path: '' },
     base: { mode: '', path: '', text: '' },
     build: { jobs: 0, output: '', llvm: false, clean: false },
@@ -94,6 +98,7 @@
     try {
       localStorage.setItem(STORE, JSON.stringify({
         selections: S.selections, extra: S.extra, source: S.source, base: S.base, build: S.build,
+        software: S.software, packages: S.packages, name: S.name,
       }));
     } catch (_) { /* private mode: state just lasts for this tab */ }
   }
@@ -106,10 +111,28 @@
         if (saved[key] && typeof saved[key] === 'object') Object.assign(S[key], saved[key]);
       }
       if (typeof saved.extra === 'string') S.extra = saved.extra;
+      if (Array.isArray(saved.software)) S.software = saved.software.filter((x) => typeof x === 'string');
+      if (typeof saved.packages === 'string') S.packages = saved.packages;
+      if (typeof saved.name === 'string') S.name = saved.name;
     } catch (_) { /* corrupt entry: start clean */ }
   }
 
   const tweakById = (id) => S.catalog.tweaks.find((t) => t.id === id);
+  const appById = (id) => S.catalog.software.find((a) => a.id === id);
+  const packageList = () => S.packages.split(/[\s,]+/).filter(Boolean);
+
+  /** Who is responsible for a config line: a tweak, an app, or the user's own lines. */
+  function originName(id) {
+    if (id === 'extra_options') return 'Extra options';
+    if (id && id.startsWith('app:')) return (appById(id.slice(4)) || {}).title || id.slice(4);
+    return (tweakById(id) || {}).title || id;
+  }
+
+  /** Everything the page knows about the kernel being put together. */
+  const recipePayload = () => ({
+    selections: S.selections, extra: S.extra, base: S.base, source: S.source,
+    software: S.software, packages: packageList(),
+  });
   const isFree = (t) => t.kind === 'text' || t.kind === 'number';
 
   function isChanged(t) {
@@ -148,6 +171,63 @@
     schedulePreview();
   }
 
+  function toggleApp(id, on) {
+    S.software = S.software.filter((x) => x !== id);
+    if (on) S.software.push(id);
+    persist();
+    schedulePreview();
+  }
+
+  /** Load a parsed .kernel file (from the server) into the page. */
+  function applyRecipe(r) {
+    S.selections = sanitizeSelections(r.selections);
+    S.extra = r.extra || '';
+    S.software = (r.software || []).filter((id) => appById(id));
+    S.packages = (r.packages || []).join(' ');
+    S.name = r.name || '';
+    S.base = { mode: r.base.mode, path: '', text: r.base.text || '' };
+    if (S.base.mode === 'running' && !S.system.running_config) S.base.mode = 'defconfig';
+    if (r.kernel_version) S.source = { mode: 'download', version: r.kernel_version, path: S.source.path };
+    if (r.output) S.build.output = r.output;
+    S.build.llvm = !!r.llvm;
+    S.acceptRisk = false;
+    S.loaded = { name: r.name, summary: r.summary || [], warnings: r.warnings || [] };
+    persist();
+    schedulePreview(0);
+  }
+
+  async function openKernelFile(file) {
+    try {
+      if (file.size > 4 * 1024 * 1024) throw new Error('That file is too large to be a .kernel file.');
+      const r = await api('kernelfile/import', { text: await file.text() });
+      applyRecipe(r);
+      S.view = 'start';
+      render();
+      window.scrollTo({ top: 0 });
+      toast(`Loaded "${r.name}"`);
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function saveKernelFile(name, embed) {
+    try {
+      const res = await api('kernelfile/export', {
+        ...recipePayload(), name: name || 'my-kernel', embed,
+        output: S.build.output, llvm: S.build.llvm,
+      });
+      const url = URL.createObjectURL(new Blob([res.text], { type: 'application/json' }));
+      const a = h('a', { href: url, download: res.filename });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast(`Saved ${res.filename}` + (res.embedded ? ' with its full config' : ''));
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
   function go(view) {
     S.view = view;
     S.search = '';
@@ -166,9 +246,7 @@
     previewTimer = setTimeout(async () => {
       const seq = ++previewSeq;
       try {
-        const p = await api('preview', {
-          selections: S.selections, extra: S.extra, base: S.base, source: S.source,
-        });
+        const p = await api('preview', recipePayload());
         if (seq !== previewSeq) return; // a newer request superseded this one
         S.preview = p;
         S.previewError = null;
@@ -201,6 +279,9 @@
       const n = S.catalog.tweaks.filter((t) => t.group === g.id && isChanged(t)).length;
       kids.push(item(g.id, g.title, n ? h('span', { class: 'badge' }, n) : null));
     }
+    kids.push(h('div', { class: 'nav-label' }, 'Software'));
+    const extras = S.software.length + packageList().length;
+    kids.push(item('software', 'Apps & packages', extras ? h('span', { class: 'badge' }, extras) : null));
     kids.push(h('div', { class: 'nav-label' }, 'Finish'));
     kids.push(item('review', 'Review & build'));
     if (S.job) {
@@ -226,21 +307,50 @@
         h('span', { class: 'o' }, label));
     });
 
+    for (const id of S.software) {
+      const a = appById(id);
+      if (!a) continue;
+      list.push(h('li', {},
+        h('span', { class: 't' }, 'Software'),
+        h('button', {
+          class: 'x', title: 'Remove ' + a.title, 'aria-label': 'Remove ' + a.title,
+          onclick: () => { toggleApp(id, false); render(); },
+        }, '×'),
+        h('span', { class: 'o' }, a.title)));
+    }
+    const pkgs = packageList();
+    if (pkgs.length) {
+      list.push(h('li', {},
+        h('span', { class: 't' }, 'Packages'),
+        h('button', {
+          class: 'x', title: 'Remove packages', 'aria-label': 'Remove packages',
+          onclick: () => { S.packages = ''; persist(); schedulePreview(); render(); },
+        }, '×'),
+        h('span', { class: 'o' }, pkgs.join(', '))));
+    }
+    const apps = S.software.length + pkgs.length;
+
     $('#summary').replaceChildren(h('div', { class: 'card' },
-      h('h2', {}, 'Your changes'),
-      changed.length
+      h('h2', {}, 'Your kernel'),
+      list.length
         ? [
             h('div', { class: 'totals' },
-              h('span', { class: 'pill accent' }, `${changed.length} tweak${changed.length === 1 ? '' : 's'}`),
+              changed.length
+                ? h('span', { class: 'pill accent' }, `${changed.length} tweak${changed.length === 1 ? '' : 's'}`)
+                : null,
+              apps ? h('span', { class: 'pill accent' }, `${apps} app${apps === 1 ? '' : 's'}`) : null,
               riskPill(risk)),
             h('ul', { class: 'change-list' }, list),
           ]
-        : h('p', { class: 'empty' }, 'Nothing changed yet. Pick a profile on the Start page or flip a tweak.'),
+        : h('p', { class: 'empty' }, 'Nothing changed yet. Pick a profile on the Start page, flip a tweak, or open a .kernel file.'),
       h('div', { class: 'actions' },
         h('button', { class: 'btn primary', onclick: () => go('review') }, 'Review & build'),
-        changed.length ? h('button', {
+        list.length ? h('button', {
           class: 'btn ghost',
-          onclick: () => { S.selections = {}; S.acceptRisk = false; persist(); schedulePreview(); render(); },
+          onclick: () => {
+            S.selections = {}; S.software = []; S.packages = ''; S.acceptRisk = false;
+            persist(); schedulePreview(); render();
+          },
         }, 'Clear all') : null)));
     // Spacing for the action row lives in CSS; mark it for the stylesheet.
     $('#summary').querySelector('.actions').classList.add('summary-actions');
@@ -359,7 +469,14 @@
             h('h3', {}, 'Your saved tweak sets'),
             h('div', { class: 'chips' }, S.saved.map((p) =>
               h('span', { class: 'chip' },
-                h('span', { onclick: () => applyProfile(p.name, p.selections, p.extra || '') }, p.name),
+                h('span', {
+                  onclick: () => {
+                    S.software = (p.software || []).filter((id) => appById(id));
+                    S.packages = (p.packages || []).join(' ');
+                    S.name = p.name;
+                    applyProfile(p.name, p.selections, p.extra || '');
+                  },
+                }, p.name),
                 ' ',
                 h('button', {
                   class: 'x', title: 'Delete ' + p.name, 'aria-label': 'Delete ' + p.name,
@@ -448,11 +565,29 @@
             oninput: (e) => setBase({ text: e.target.value }),
           }, S.base.text))));
 
+    const picker = h('input', {
+      type: 'file', accept: '.kernel,application/json', hidden: true, 'aria-label': 'Choose a .kernel file',
+      onchange: (e) => { if (e.target.files[0]) openKernelFile(e.target.files[0]); e.target.value = ''; },
+    });
+    const loaded = S.loaded
+      ? h('section', { class: 'card stack loaded' },
+          h('div', { class: 'card-head' },
+            h('h2', {}, `Loaded from a .kernel file: ${S.loaded.name}`),
+            h('button', { class: 'btn small ghost', onclick: () => { S.loaded = null; renderMain(); } }, 'Dismiss')),
+          h('p', { class: 'desc' }, 'Everything below is filled in from the file. Nothing has been built or installed - look it over, then go to Review & build.'),
+          h('pre', { class: 'fragment' }, S.loaded.summary.join('\n')),
+          S.loaded.warnings.map((w) => h('div', { class: 'notice caution' },
+            h('span', { class: 'tag' }, 'Skipped'), h('span', {}, w))))
+      : null;
+
     return [
       h('div', { class: 'section-head' },
         h('h1', {}, 'Build a kernel for this machine'),
-        h('p', { class: 'lede' }, 'Choose what you want in plain terms, see exactly which CONFIG_ options that changes, then build it. Nothing is installed unless you ask.')),
-      machine, profiles, source, base,
+        h('p', { class: 'lede' }, 'Choose what you want in plain terms, see exactly which CONFIG_ options that changes, then build it. Nothing is installed unless you ask.'),
+        h('div', { class: 'actions head-actions' },
+          h('button', { class: 'btn', onclick: () => picker.click() }, 'Open a .kernel file'), picker,
+          h('span', { class: 'empty' }, 'A .kernel file is a saved kernel: its tweaks, software and settings.'))),
+      loaded, machine, profiles, source, base,
       h('div', { class: 'actions' },
         h('button', { class: 'btn primary', onclick: () => go(S.catalog.groups[0].id) }, 'Start tweaking'),
         h('button', { class: 'btn', onclick: () => go('review') }, 'Skip to review')),
@@ -468,7 +603,61 @@
       h('div', { class: 'actions' },
         next
           ? h('button', { class: 'btn primary', onclick: () => go(next.id) }, `Next: ${next.title}`)
-          : h('button', { class: 'btn primary', onclick: () => go('review') }, 'Review & build')),
+          : h('button', { class: 'btn primary', onclick: () => go('software') }, 'Next: Apps & packages')),
+    ];
+  }
+
+  /** The install plan for the chosen software: commands to copy, and caveats. */
+  function softwareCard(plan, built) {
+    return h('section', { class: 'card stack' },
+      h('h2', {}, built ? 'Install your software' : 'Software to install'),
+      h('p', { class: 'desc' }, built
+        ? 'Once you are running the new kernel, these install the software you picked. kertweaker does not run them for you.'
+        : 'Apps are not part of a kernel, so they are installed alongside it. After the build you get these commands to run yourself.'),
+      plan.commands.map((cmd) => h('div', { class: 'cmd-row' }, h('code', {}, cmd),
+        h('button', { class: 'btn small', onclick: () => copy(cmd) }, 'Copy'))),
+      plan.notes.map((n) => h('div', { class: 'notice caution' }, h('span', { class: 'tag' }, 'Note'), h('span', {}, n))),
+      !plan.commands.length && !plan.notes.length
+        ? h('p', { class: 'empty' }, 'Nothing to install.') : null);
+  }
+
+  function viewSoftware() {
+    const s = S.system;
+    const card = (a) => {
+      const on = S.software.includes(a.id);
+      const sets = Object.entries(a.kernel);
+      const how = a.packages.length ? a.packages.join(' ')
+        : a.flatpak ? `Flatpak ${a.flatpak}` : 'no package known for this distribution';
+      return h('label', { class: 'card app' + (on ? ' changed' : '') },
+        h('input', { type: 'checkbox', checked: on, onchange: (e) => { toggleApp(a.id, e.target.checked); render(); } }),
+        h('div', { class: 'app-body' },
+          h('h3', {}, a.title),
+          h('p', { class: 'desc' }, a.description),
+          h('p', { class: 'meta' },
+            sets.length ? `Turns on ${sets.length} kernel option${sets.length === 1 ? '' : 's'}` : 'No kernel changes needed',
+            ' · installs ', h('code', {}, how)),
+          on && a.note ? h('p', { class: 'note' }, a.note) : null,
+          sets.length
+            ? h('details', { onclick: (e) => e.stopPropagation() },
+                h('summary', {}, `Show the ${sets.length} kernel option${sets.length === 1 ? '' : 's'}`),
+                h('span', { class: 'symbols' }, sets.map(([sym, val]) =>
+                  h('span', { class: 'sym' }, `${sym}=${val}`))))
+            : null));
+    };
+    return [
+      h('div', { class: 'section-head' },
+        h('h1', {}, 'Apps & packages'),
+        h('p', { class: 'lede' }, 'Apps live on top of a kernel - they cannot be compiled into one. What kertweaker can do is make sure your kernel has the features each app needs, and carry the list in your .kernel file so everything gets installed together.')),
+      h('div', { class: 'app-list' }, S.catalog.software.map(card)),
+      h('section', { class: 'card stack' },
+        h('h2', {}, 'Other packages'),
+        h('p', { class: 'desc' }, `Anything else from your distribution's repositories${s.packages.install_prefix ? ` (installed with "${s.packages.install_prefix.replace('sudo ', '')}")` : ''}. Separate names with spaces. These do not change the kernel.`),
+        h('input', {
+          type: 'text', placeholder: 'htop vim git', value: S.packages, 'aria-label': 'Other packages',
+          oninput: (e) => { S.packages = e.target.value; persist(); schedulePreview(600); renderNav(); renderSummary(); },
+        })),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn primary', onclick: () => go('review') }, 'Review & build')),
     ];
   }
 
@@ -510,8 +699,9 @@
           h('span', {}, n.text)));
       const conflicts = r.conflicts.map((c) =>
         h('div', { class: 'notice caution' }, h('span', { class: 'tag' }, 'Override'),
-          h('span', {}, 'Your extra options set ', h('code', {}, `${c.symbol}=${c.winning_value}`),
-            `, replacing ${c.previous_value} from "${(tweakById(c.previous_tweak) || {}).title || c.previous_tweak}".`)));
+          h('span', {}, c.winning_tweak === 'extra_options' ? 'Your extra options set ' : `${originName(c.winning_tweak)} needs `,
+            h('code', {}, `${c.symbol}=${c.winning_value}`),
+            `, replacing ${c.previous_value} from "${originName(c.previous_tweak)}".`)));
       if (notes.length || conflicts.length) out.push(h('div', { class: 'stack' }, notes, conflicts));
 
       // ------------------------------------------------------------- diff
@@ -526,8 +716,7 @@
             h('thead', {}, h('tr', {}, h('th', {}, 'Because of'), h('th', {}, 'Before'), h('th', {}, 'After'))),
             h('tbody', {}, p.changes.map((c) =>
               h('tr', { class: c.kind },
-                h('td', { class: 'why' }, c.tweak === 'extra_options' ? 'Extra options'
-                  : (tweakById(c.tweak) || {}).title || c.tweak),
+                h('td', { class: 'why' }, originName(c.tweak)),
                 h('td', { class: 'mono before' }, c.before || '(absent)'),
                 h('td', { class: 'mono after' }, c.after)))))));
           diffCard.append(h('p', { class: 'desc' },
@@ -543,6 +732,17 @@
         }
       } else {
         diffCard.append(h('div', { class: 'notice' }, h('span', { class: 'tag' }, 'No comparison'), h('span', {}, p.base.error)));
+        // Nothing to diff against, but what is being asked for - and by what -
+        // is still worth seeing before a build.
+        const rows = Object.entries(r.fragment);
+        if (rows.length) {
+          diffCard.append(h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Because of'), h('th', {}, 'Requested'))),
+            h('tbody', {}, rows.map(([sym, val]) =>
+              h('tr', { class: val == null ? 'disabled' : 'enabled' },
+                h('td', { class: 'why' }, originName(r.origin[sym])),
+                h('td', { class: 'mono after' }, val == null ? `# ${sym} is not set` : `${sym}=${val}`)))))));
+        }
       }
       if (r.localmodconfig) {
         diffCard.append(h('div', { class: 'notice caution' }, h('span', { class: 'tag' }, 'Trim'),
@@ -572,22 +772,37 @@
         oninput: (e) => { S.extra = e.target.value; persist(); schedulePreview(600); },
       }, S.extra)));
 
+    // ----------------------------------------------------------- software
+    if (p && (S.software.length || packageList().length)) out.push(softwareCard(p.software_plan, false));
+
     // --------------------------------------------------------------- save
-    const nameInput = h('input', { type: 'text', placeholder: 'e.g. my-desktop', 'aria-label': 'Name for this tweak set' });
+    const nameInput = h('input', {
+      type: 'text', placeholder: 'e.g. my-desktop', value: S.name, 'aria-label': 'Name for this kernel',
+      oninput: (e) => { S.name = e.target.value; persist(); },
+    });
+    const embed = h('input', { type: 'checkbox' });
     out.push(h('section', { class: 'card stack' },
-      h('h2', {}, 'Save this tweak set'),
-      h('p', { class: 'desc' }, 'Keep it for the next kernel release. Saved sets show up on the Start page.'),
-      h('div', { class: 'inline' }, nameInput,
+      h('h2', {}, 'Save this kernel'),
+      h('p', { class: 'desc' }, 'A .kernel file holds everything on this page - tweaks, extra options, software and build settings - so you can rebuild it later, on another machine, or share it.'),
+      h('label', { class: 'field' }, h('span', {}, 'Name'), nameInput),
+      h('label', { class: 'check' }, embed,
+        h('span', {}, 'Include the full starting config',
+          h('span', { class: 'sub' }, 'Makes the file rebuild this exact kernel anywhere, instead of starting from whatever kernel the other machine runs. Adds a few hundred kilobytes.'))),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn primary', onclick: () => saveKernelFile(S.name.trim(), embed.checked) }, 'Save .kernel file'),
         h('button', {
           class: 'btn',
           onclick: async () => {
             try {
-              await api('saved', { name: nameInput.value, selections: S.selections, extra: S.extra });
+              await api('saved', {
+                name: S.name, selections: S.selections, extra: S.extra,
+                software: S.software, packages: packageList(),
+              });
               S.saved = await api('saved');
-              toast('Saved');
+              toast('Kept on the Start page');
             } catch (e) { toast(e.message); }
           },
-        }, 'Save'))));
+        }, 'Keep in kertweaker'))));
 
     // -------------------------------------------------------- build options
     const b = S.build;
@@ -661,7 +876,7 @@
   async function startBuild(configOnly) {
     try {
       const res = await api('build', {
-        source: S.source, base: S.base, selections: S.selections, extra: S.extra,
+        ...recipePayload(),
         jobs: S.build.jobs, output: S.build.output, llvm: S.build.llvm, clean: S.build.clean,
         config_only: configOnly, accept_risk: S.acceptRisk,
       });
@@ -847,6 +1062,9 @@
             : h('p', { class: 'desc' }, cmd))));
       }
     }
+    if (job.status === 'done' && job.software && (job.software.commands.length || job.software.notes.length)) {
+      res.push(softwareCard(job.software, true));
+    }
     if (job.config_path) {
       res.push(h('div', { class: 'actions' },
         h('a', { class: 'btn', href: `/api/jobs/${encodeURIComponent(job.id)}/config` }, 'Download final .config'),
@@ -867,6 +1085,7 @@
     let nodes;
     if (S.search) nodes = viewSearch();
     else if (S.view === 'start') nodes = viewStart();
+    else if (S.view === 'software') nodes = viewSoftware();
     else if (S.view === 'review') nodes = viewReview();
     else if (S.view === 'build') nodes = viewBuild();
     else nodes = viewGroup(S.catalog.groups.find((g) => g.id === S.view) || S.catalog.groups[0]);
@@ -891,6 +1110,7 @@
       return;
     }
     S.selections = sanitizeSelections(S.selections);
+    S.software = S.software.filter((id) => appById(id));
     if (!S.build.jobs) S.build.jobs = S.system.suggested_jobs;
     if (!S.build.output) {
       const native = { deb: 'deb', rpm: 'rpm' }[S.system.package_family];
@@ -910,6 +1130,15 @@
         $('#search').focus();
       }
     });
+
+    // A .kernel file given on the command line is loaded straight in.
+    api('preload').then((r) => {
+      if (!r) return;
+      applyRecipe(r);
+      S.view = 'start';
+      render();
+      toast(`Loaded "${r.name}"`);
+    }).catch(() => {});
 
     api('releases').then((r) => {
       S.releases = r;

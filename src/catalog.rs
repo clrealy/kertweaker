@@ -1058,6 +1058,15 @@ impl Resolved {
                 ),
             ),
             ("unknown", Json::strs(self.unknown.clone())),
+            (
+                "origin",
+                Json::Obj(
+                    self.origin
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Json::s(v.clone())))
+                        .collect(),
+                ),
+            ),
         ])
     }
 }
@@ -1077,8 +1086,27 @@ pub fn resolve(selections: &BTreeMap<String, String>) -> Resolved {
 /// discarding a tweak the user also clicked on is exactly the surprise this
 /// tool exists to avoid.
 pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) -> Resolved {
+    resolve_full(selections, &[], extra)
+}
+
+/// Kernel options some piece of software needs, to be layered over the tweaks.
+#[derive(Debug, Clone)]
+pub struct Requirement {
+    /// Shown as the cause in diffs and conflicts, e.g. `app:steam`.
+    pub origin: String,
+    pub sets: Vec<(&'static str, Option<&'static str>)>,
+}
+
+/// The full resolution: tweaks first, then what selected software requires,
+/// then the user's own extra lines. Each layer wins over the one before it,
+/// and every value it replaces is reported as a conflict.
+pub fn resolve_full(
+    selections: &BTreeMap<String, String>,
+    requirements: &[Requirement],
+    extra: &str,
+) -> Resolved {
     let mut out = Resolved::default();
-    let mut origin: BTreeMap<String, &str> = BTreeMap::new();
+    let mut origin: BTreeMap<String, String> = BTreeMap::new();
 
     for t in tweaks() {
         let Some(chosen) = selections.get(t.id) else {
@@ -1119,7 +1147,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
                 }
             };
             upsert(&mut out.fragment, t.symbol, Some(value));
-            origin.insert(t.symbol.to_string(), t.id);
+            origin.insert(t.symbol.to_string(), t.id.to_string());
             continue;
         }
 
@@ -1154,7 +1182,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
                 if existing.1 != value {
                     out.conflicts.push(Conflict {
                         symbol: symbol.to_string(),
-                        previous_tweak: origin.get(*symbol).copied().unwrap_or("?").to_string(),
+                        previous_tweak: origin.get(*symbol).cloned().unwrap_or_default(),
                         previous_value: show(&existing.1),
                         winning_tweak: t.id.to_string(),
                         winning_value: show(&value),
@@ -1162,7 +1190,29 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
                 }
             }
             upsert(&mut out.fragment, symbol, value);
-            origin.insert(symbol.to_string(), t.id);
+            origin.insert(symbol.to_string(), t.id.to_string());
+        }
+    }
+
+    // What selected software needs. Two apps never disagree with each other
+    // (a test enforces it), so only clashes with tweaks are worth reporting.
+    for req in requirements {
+        for (symbol, value) in &req.sets {
+            let value = value.map(|s| s.to_string());
+            if let Some(existing) = out.fragment.iter().find(|(s, _)| s == symbol) {
+                let from_tweak = origin.get(*symbol).is_some_and(|o| !o.starts_with("app:"));
+                if existing.1 != value && from_tweak {
+                    out.conflicts.push(Conflict {
+                        symbol: symbol.to_string(),
+                        previous_tweak: origin.get(*symbol).cloned().unwrap_or_default(),
+                        previous_value: show(&existing.1),
+                        winning_tweak: req.origin.clone(),
+                        winning_value: show(&value),
+                    });
+                }
+            }
+            upsert(&mut out.fragment, symbol, value);
+            origin.insert(symbol.to_string(), req.origin.clone());
         }
     }
 
@@ -1171,7 +1221,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
             if existing.1 != value {
                 out.conflicts.push(Conflict {
                     symbol: symbol.clone(),
-                    previous_tweak: origin.get(&symbol).copied().unwrap_or("?").to_string(),
+                    previous_tweak: origin.get(&symbol).cloned().unwrap_or_default(),
                     previous_value: show(&existing.1),
                     winning_tweak: EXTRA.to_string(),
                     winning_value: show(&value),
@@ -1179,7 +1229,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
             }
         }
         upsert(&mut out.fragment, &symbol, value);
-        origin.insert(symbol, EXTRA);
+        origin.insert(symbol, EXTRA.to_string());
     }
 
     for id in selections.keys() {
@@ -1189,10 +1239,7 @@ pub fn resolve_with_extra(selections: &BTreeMap<String, String>, extra: &str) ->
     }
     out.unknown.sort();
     out.unknown.dedup();
-    out.origin = origin
-        .into_iter()
-        .map(|(k, v)| (k, v.to_string()))
-        .collect();
+    out.origin = origin;
     out
 }
 
@@ -1208,6 +1255,17 @@ fn show(v: &Value) -> String {
         Some(x) => x.clone(),
         None => "n".to_string(),
     }
+}
+
+/// Render a fragment as `.config` syntax in the order given, which keeps a
+/// user's hand-written lines the way they wrote them.
+pub fn fragment_text_ordered(fragment: &[(String, Value)]) -> String {
+    let mut out = String::new();
+    for (sym, val) in fragment {
+        out.push_str(&crate::kconfig::format_line(sym, val));
+        out.push('\n');
+    }
+    out
 }
 
 /// Render a fragment as `.config` syntax, sorted for readability.

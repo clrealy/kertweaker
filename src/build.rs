@@ -98,6 +98,10 @@ pub struct Request {
     pub base: Base,
     pub selections: BTreeMap<String, String>,
     pub extra: String,
+    /// Apps whose kernel requirements are layered in (see [`crate::software`]).
+    pub software: Vec<String>,
+    /// Extra package names to install alongside the kernel.
+    pub packages: Vec<String>,
     pub jobs: usize,
     pub output: Output,
     pub llvm: bool,
@@ -221,6 +225,8 @@ pub struct JobState {
     pub builtin_instead: Vec<String>,
     /// Plain-language observations about the resolved config.
     pub advice: Vec<String>,
+    /// How to install the software that goes with this kernel.
+    pub software: crate::software::Plan,
     pub diff_count: usize,
     pub config_path: Option<PathBuf>,
     pub tree: Option<PathBuf>,
@@ -403,6 +409,7 @@ impl Job {
             ),
             ("builtin_instead", Json::strs(st.builtin_instead.clone())),
             ("advice", Json::strs(st.advice.clone())),
+            ("software", st.software.to_json()),
             ("log_dropped", Json::u(st.dropped)),
             ("log_total", Json::u(st.dropped + st.log.len())),
         ];
@@ -474,6 +481,7 @@ pub fn new_job(id: String, req: Request) -> Arc<Job> {
             unapplied: Vec::new(),
             builtin_instead: Vec::new(),
             advice: Vec::new(),
+            software: crate::software::Plan::default(),
             diff_count: 0,
             config_path: None,
             tree: None,
@@ -628,7 +636,7 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
             ));
         }
     }
-    let resolved = catalog::resolve_with_extra(&req.selections, &req.extra);
+    let resolved = crate::software::resolve(&req.selections, &req.software, &req.extra);
     if resolved.needs_clang() && !req.llvm {
         job.log("Link-time optimisation is clang-only, so this build uses LLVM=1.");
         job.llvm.store(true, Ordering::Relaxed);
@@ -793,11 +801,21 @@ fn run_inner(job: &Arc<Job>) -> Result<(), String> {
     for line in &advice {
         job.log(&format!("note: {line}"));
     }
+    // Work out how the accompanying software gets installed. Nothing is
+    // installed here: the plan is shown to the user to run themselves.
+    let family = crate::system::package_family();
+    let plan = crate::software::plan(&req.software, &req.packages, family, &|p| {
+        crate::software::available(family, p)
+    });
+    for note in &plan.notes {
+        job.log(&format!("note: {note}"));
+    }
     {
         let mut st = job.state.lock().map_err(|_| "state poisoned")?;
         st.unapplied = unapplied.clone();
         st.builtin_instead = verification.builtin_instead.clone();
         st.advice = advice;
+        st.software = plan;
     }
     job.finish(
         "verify",

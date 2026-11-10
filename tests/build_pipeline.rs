@@ -14,6 +14,8 @@ fn request(f: &Fixture, sel: BTreeMap<String, String>) -> Request {
         base: Base::Defconfig,
         selections: sel,
         extra: String::new(),
+        software: Vec::new(),
+        packages: Vec::new(),
         jobs: 2,
         output: Output::Image,
         llvm: false,
